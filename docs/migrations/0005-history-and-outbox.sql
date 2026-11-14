@@ -29,3 +29,5 @@ WHEN NEW.valid_to IS NOT NULL AND NEW.valid_to <= NEW.valid_from
 BEGIN
   SELECT RAISE(ABORT, 'invalid_validity_window');
 END;
+
+UPDATE schema_meta SET schema_version = 5 WHERE id = 1;

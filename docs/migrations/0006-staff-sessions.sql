@@ -74,3 +74,5 @@ WHEN OLD.ended_at IS NOT NULL AND NEW.ended_at IS NOT OLD.ended_at
 BEGIN
   SELECT RAISE(ABORT, 'session_already_closed');
 END;
+
+UPDATE schema_meta SET schema_version = 6 WHERE id = 1;

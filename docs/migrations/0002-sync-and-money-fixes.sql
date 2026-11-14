@@ -103,3 +103,5 @@ CREATE INDEX IF NOT EXISTS idx_sales_daily_item
 -- bills; this index makes the watermark query cheap.
 -- ---------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_bills_received_at ON bills(received_at);
+
+UPDATE schema_meta SET schema_version = 2 WHERE id = 1;

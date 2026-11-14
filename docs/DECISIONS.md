@@ -17,6 +17,10 @@ Cost: the pull is a range scan plus a handful of `IN (...)` fetches, not one que
 duplicating every document into the log, and it keeps the log small enough to prune. A terminal offline longer
 than the retained window gets `410 stale_cursor` and must full-refresh.
 
+**Revised 2026-11-14.** The delta embeds documents (`api-routes.md` §3.3); the fetch-by-id step above is
+withdrawn. The prune floor is `MIN(devices.last_catalog_seq)` over active devices, recorded on each pull
+(migration 0008); before 0008 no column held it.
+
 ## D2. Bills stay immutable; the server verifies, it never rewrites
 
 The Worker recomputes the applicable list price and ceiling from its own `item_prices` at push time and stores
@@ -27,6 +31,10 @@ Why: the security review's F1 — a modified terminal can otherwise write any re
 that makes its discount look in-policy. Rejecting the bill is worse: it loses a real sale. Verify, record both,
 surface the delta.
 
+**Revised 2026-11-14.** `price_minor` and `list_price_minor` are rates per `price_basis_qty_base`, which is
+mandatory on the wire. The old canonical example sent a 1.5 kg line with no basis, which reads as a per-gram
+price and would have flagged every tiered line as `price_mismatch`.
+
 ## D3. Offline caps authority, not the sale
 
 Offline with no valid `approval_grant`, a line falls back to the store ceiling or list price. The sale still
@@ -34,6 +42,9 @@ completes. Beyond-ceiling prices require a cached, unexpired grant minted online
 
 Why: F2 — "allow and flag" gives every cashier unlimited discount authority by unplugging the LAN. This keeps
 availability while removing the incentive.
+
+**Revised 2026-11-14.** The ceiling is only checkable if the discount is: 0003's identity skipped when
+`list_amount_minor = 0`, the column default. 0008 removes the bypass (`line_total = list_amount − discount`).
 
 ## D4. A terminal has an offline lease
 
@@ -51,6 +62,10 @@ web → credential issued. Codes are single-use, 15 min, high entropy.
 
 Why: F9 — a code typed in the open is observable; approval of a specific install closes the race.
 
+**Revised 2026-11-14.** The route table issued the credential at enrol, so D5 was not in the design. Now
+`/v1/enroll` creates a pending device, `/v1/token` answers `403 approval_pending` until the owner approves
+(`devices.approved_at`, 0008).
+
 ## D6. Device JWT lives 5 minutes; revocation is immediate
 
 No refresh token; the credential is the refresh mechanism. Revocation writes to KV synchronously and the token
@@ -58,6 +73,9 @@ TTL bounds the rest. Rotation marks the old credential superseded on first use o
 
 Why: F10/F11 — 15 minutes plus a 60 s cache is a long window for a stolen credential, and "keep the old until
 the next call" leaves two live secrets.
+
+**Revised 2026-11-14.** "Immediate" was wrong: KV is eventually consistent. Revocation takes effect within
+the 5-minute JWT TTL; `/v1/token` reads `devices.revoked_at` from D1, KV is only a shortcut.
 
 ## D7. Attribution is cryptographic when online, asserted when offline
 
@@ -68,6 +86,9 @@ Migration 0004 adds both columns and a trigger that rejects a `password` bill wi
 
 Why: F5/F17 — a cached PIN hash is brute-forceable from a stolen disk, so a PIN can never be the thing that
 proves a human. The assertion is the only claim the server can verify.
+
+**Superseded by D16.** Migration 0006 dropped `staff_assertion_id` and its trigger; the assertion now rides
+the staff session row.
 
 ## D8. No money-gating secret ships to a terminal
 
@@ -90,12 +111,19 @@ allowed; a year range is rejected with `413 range_too_large` rather than risking
 
 Why: D1's real ceiling is query duration and result size, not the 10 GB storage cap.
 
+**Revised 2026-11-14.** One rule: 92 days maximum; a single day reads `bill_lines`, more than one reads
+`sales_daily`, so the 30 s argument no longer applies to month reports.
+
 ## D11. `business_date` is validated, not trusted
 
 The terminal computes it from the store's `business_day_start_minutes`. The Worker rejects a bill whose
 `business_date` is more than one day from the server's date, and records `received_at` for every bill.
 
 Why: F14 — otherwise a terminal can move sales between report days.
+
+**Revised 2026-11-14.** The ±1-day rule is withdrawn (`api-routes.md` §9 item 4 already did): `business_date`
+is checked against `created_at` plus the store's cutover, and the cutover is copied onto the bill
+(`bills.business_day_start_minutes`, 0008) so a later change cannot move old sales between days.
 
 ## Open questions for the owner
 
@@ -104,15 +132,27 @@ Why: F14 — otherwise a terminal can move sales between report days.
 3. Retention: how long do bills stay in D1 before archiving to R2? 10 GB is years at current volume, but the
    policy has to exist before it is urgent.
 
+Question 3 is answered by D22.
+
 ## D12. One bill per batch, never 100 (TRIAGE B1)
 
 A malformed bill must not roll back 99 good ones, and a lost response must not duplicate lines. The terminal
 pipelines requests; the server commits one bill per `db.batch()` and returns `accepted`/`rejected` per bill.
 
+**Verified on D1, 2026-11-14.** A Worker invocation may make 1,000 D1 calls; a `db.batch()` is one call
+whatever it contains. 100 batches of 14 statements succeeded; 1,001 batches of one failed with "Too many API
+requests by single Worker invocation". A 100-bill push uses ~100–200 calls. Each bill's batch runs
+`PRAGMA defer_foreign_keys = on`, lines, movements, then the header (D23).
+
 ## D13. `sales_daily` is the month report's source (TRIAGE B5)
 
 Upserted in the bill's batch. The day report still reads `bill_lines`; the month report reads 30 × items.
 Rebuildable from `bill_lines` after a restore or a void.
+
+**Revised 2026-11-14.** The rollup is maintained by triggers (0008): `AFTER INSERT ON bills` adds,
+`AFTER INSERT ON bill_voids` subtracts. Upserting it from the Worker double-counted when two invocations
+replayed the same bill: the bill insert was `ON CONFLICT DO NOTHING`, the rollup upsert was not. A trigger
+fires only when the bill row is actually inserted.
 
 ## D14. `synchronous=FULL` on the billing connection (TRIAGE B7)
 
@@ -123,6 +163,11 @@ WAL + `NORMAL` can lose the last committed bill on power loss. At ~1 bill/s the 
 Money columns on `bills` and every column on `bill_lines` are frozen after insert; `invoice_no` may be assigned
 once; a void needs an actor and a reason. SQLite cannot add table constraints by `ALTER`, so migration 0004
 uses triggers — which also run on the terminal, where the same rules must hold.
+
+**Revised 2026-11-14.** Three holes, all reproduced: deleting a bill cascaded its lines away past the line
+trigger; a voided bill could be un-voided; the discount identity had a bypass. 0008 adds a delete guard
+(`business_date < schema_meta.archive_before`, which is also the archival gate of D22), a void-once trigger,
+and voids only through `bill_voids`.
 
 ## D16. Cashier identity is a session, and logout is local-first (migration 0006)
 
@@ -139,6 +184,13 @@ queues the row for the next push. Offline logout therefore works, and a bill cre
 valid because validity is the window, not the push order. The route is used when the terminal is online and
 the owner wants the assertion revoked within seconds.
 
+**Revised 2026-11-14.** The window stays, but a mismatch is **accepted and flagged** (`unverified_staff`),
+never aborted. As triggers on the shared DDL the rule rejected sales on the terminal itself: a 2-second
+clock step back after login, and a cart finished after switch-user (both reproduced on `modernc.org/sqlite`).
+0008 drops both triggers. Session push is an upsert that applies `ended_at` once; before, duplicate session
+ids were acked and never updated, so the server's copy stayed open and the next login failed
+`uq_staff_sessions_live`. On the terminal an open cart blocks switch-user.
+
 ## D17. Better Auth owns the admin plane; the device plane stays custom (migration 0007)
 
 Better Auth handles email/password, Google OAuth, TOTP, session rotation and CSRF for the admin web. The
@@ -152,6 +204,14 @@ either.
 Also corrected: rate-limit counters cannot live in Workers KV (no atomic ops, 60 s minimum TTL). Use D1 or a
 Durable Object.
 
+**Revised 2026-11-14.** The table mapping in this entry did not work. Verified on Better Auth 1.7.23 against
+a local D1: `modelName` renames tables, not columns, and its startup check refused to run; with columns
+mapped it still needed `sessions.token`; with that fixed, every sign-up failed because Better Auth writes
+dates as ISO TEXT into STRICT INTEGER columns. Better Auth now owns separate `auth_*` tables with TEXT dates
+(0007, rewritten); domain `users` links by `users.auth_user_id`. The `admin` plugin is dropped (roles and store
+scope are ours). The instance is built **per request**: a module-level instance wrote tenant B's owner into
+tenant A's database. Details in `auth-better-auth.md`.
+
 ## D18. One enterprise, one D1; stores are rows (measured, not estimated)
 
 A tenant is an enterprise. Its stores, terminals, cashiers and bills live in one database. There is no
@@ -162,6 +222,14 @@ rollup. Five stores at 600 bills/day is 1.17 GB/year, or about 8.6 years to the 
 bill it is about 3.4 years. The earlier "10 months" figure was an estimate ten times too high and is withdrawn.
 
 The growth answer is archival: export bills older than the retention window to R2 and keep `sales_daily`.
+
+**Revised 2026-11-14 — the 1,067-byte figure is withdrawn.** It does not reproduce and its script was never
+committed. Measured on real D1: **4,961 bytes per 4-line bill** (3,000 realistic bills, 0.71 → 15.60 MB), so
+5 stores × 600 bills/day is ~5.4 GB/year, ~1.8 years to the cap with no archival; at 10 lines, under a year.
+One D1 per enterprise still holds because archival is now v1 (D22) and D1 reclaims space on delete
+(verified). An enterprise that would pass 70% of 10 GB at 12 months' retention gets one D1 per group of
+stores; every billing row carries `store_id`, so the split is a copy. `capacity.md` has the table;
+`capacity-bench.py` reproduces it.
 
 ## D19. Sharded by enterprise, not pooled — the arithmetic decides it
 
@@ -196,6 +264,9 @@ release path than twenty ordinary Workers.
 At ten to twenty tenants, per-tenant Workers are the simplest thing that satisfies isolation *and* pinning.
 Revisit at roughly fifty tenants, or when the deploy matrix itself becomes the bottleneck; the handlers are
 already tenant-agnostic, so that move is a deployment change, not a rewrite.
+
+**Revised 2026-11-14.** At the measured 4,961 bytes per bill, the pooled database in the first row fills in
+about 67 days, not 312. The conclusion is stronger, not different.
 
 ## D20. One Worker, N databases — compute pooled, data sharded
 
@@ -249,6 +320,22 @@ costs a second workflow, not a second codebase. Default simple, exception possib
 Revisit at roughly a hundred tenants, where Workers for Platforms (one upload, per-tenant script instances)
 beats both.
 
+**Revised 2026-11-14 — tenant resolution is the isolation boundary.** One Worker means the old
+`tenant_id == TENANT_ID` environment check no longer exists, and nothing replaced it. Every request now:
+
+1. `tenant = HOSTS[Host]`, else `421 unknown_host`; `db = env[tenant.binding]`.
+2. `schema_meta.tenant_id == tenant.id`, cached per isolate, else `503 tenant_mismatch`.
+3. Device JWT: key chosen by `kid` and derived for **the routed tenant**,
+   `HKDF-SHA256(MASTER_KEY_<kid>, salt "traasu", info "device-jwt/v1/" + tenant.id)` — never from a claim;
+   then `claim.tenant_id == tenant.id`, `aud`, `typ`, `scope`; the `devices` row must exist.
+4. Admin: Better Auth built per request with `db` and `baseURL` for this host (D17).
+
+Deriving the key from the claim would let a token minted for A verify at B, and the old seed gave every
+tenant the same store and terminal ids, so A's claims would have resolved in B's database. 0001 no longer
+seeds them. Cost of HKDF stated plainly: a leaked master derives every tenant's keys, so the per-tenant
+secrets in the old deploy inventory bought isolation this does not. Rotation adds `MASTER_KEY_<newkid>` and
+verifies both for 12 h, the life of the longest token (grants, assertions).
+
 ## D21. A control-plane D1 holds tenant metadata; it cannot hold the routing table
 
 The ask: Hono keeps the tenant → database map in a metadata D1. Half of that is right, and the other half is
@@ -301,3 +388,63 @@ Three reasons, in order of how much they hurt:
 The only Cloudflare-native way to add a tenant without touching the Worker config is **Workers for
 Platforms** — each tenant gets its own script instance with its own bindings, and a dispatcher routes by host.
 That is the answer at a hundred tenants, not at ten. A metadata D1 is not a substitute for it.
+
+**Revised 2026-11-14.** Schema level has one source of truth per tenant: that database's `d1_migrations`
+table, mirrored in `schema_meta.schema_version` (every migration now sets it; before, nothing did and it
+read 1 after 0007). META `tenant_schema` and `infra/versions.json` are caches the migrate workflow writes.
+Release order is migrate (expand) → deploy → smoke; a Worker declares `min_schema` and must run on every
+schema from there up (`release-management.md`).
+
+## D22. Archival is v1, behind a per-tenant flag
+
+The owner sets **retention in months** in the admin panel; archival is a per-tenant feature flag
+(`tenant_flags.archival_enabled`). A monthly job per tenant, outside shop hours and in batches of ≤ 500 bills:
+
+1. Export a store-month to R2 (`archive/<tenant>/<store>/<yyyy-mm>.jsonl.gz`: bills, lines, voids).
+2. Verify row counts and Σ totals against D1.
+3. Advance `schema_meta.archive_before`, delete that month's `bill_voids`, then its bills (lines and
+   movements cascade). `sales_daily` stays, so reports on archived months still work.
+
+Why: D18's measured growth. Verified on D1: deletes free space at once (301 → 151 MB; 900 bills 15.60 →
+12.67 MB, the rest being kept `sales_daily` rows), and `VACUUM` is refused and not needed. The first delete
+took **8,048 ms and read 73,463,700 rows** because `inventory_movements` had no index on its FK to
+`bill_lines`; with `idx_inventory_movements_line` (0008), **55 ms and 33,600 rows**.
+
+Sizing: keep the retained window under 70% of 10 GB: ≈ 15 months at 5 stores and 4 lines, ≈ 7 at 10 lines.
+R2 keeps at least six years — the GST record period as we understand it; to be confirmed with the
+owner's accountant. Terminals keep 30 days of synced bills for the restore re-push (D20, `api-routes.md` §4).
+A void for an archived bill is parked `bill_archived`, never dropped.
+
+Cost: R2 joins the inventory, and a month's receipt detail needs a restore into a scratch D1 to query.
+
+## D23. Money rules, one place
+
+- Line: `line_total = taxable + cgst + sgst + cess + igst` (0002 omitted IGST, so an IGST line could only be
+  stored with the tax missing from its total) and `line_total = list_amount − discount`.
+- Split: `cgst = floor(tax / 2)`, `sgst = tax − cgst`. With round-half-up on both halves a ₹10.29 line at 5%
+  sums to 1,030 paise, and the identity trigger aborted the sale on the terminal.
+- Header: `subtotal = Σ taxable`, `tax = Σ taxes`, `total = Σ line_total + rounding`, at least one line.
+  Enforced by inserting lines first and the header last in one transaction with deferred foreign keys.
+  Tax is per line; a per-rate summary is derived from lines, never computed separately (three ₹10.01 lines
+  at 18% give 459 per line and 458 on the invoice total).
+
+`docs/check-invariants.py` holds each of these as a case.
+
+## D24. Workers Paid before the first tenant
+
+The Free plan caps a database at 500 MB and a day at 100,000 rows written and 5 million read; the D1
+experiments used up both daily quotas on 3,000 bills and one unindexed delete. One bill writes about 42 rows
+including index entries.
+
+## D25. One-way doors, closed before code
+
+From the deferred list in `TRIAGE.md` §F, the ones that change immutable rows or need a table rebuild:
+
+| Item | Decision |
+|---|---|
+| D42 business day | `bills.business_day_start_minutes` copied at sale time (0008) |
+| D30 attribution | devices and shifts are never deleted (0008 triggers) |
+| D33 grants | `bill_lines.approval_grant_id`; the Worker counts uses against `max_overrides` |
+| D45 returns | quantities and totals stay positive; returns are a separate document type after v1 |
+| D44, D46 enums | no new CHECK vocabularies on `bills`, `bill_lines`, `catalog_changes`; the Worker validates |
+| D16, D17 price revisions | still open; decide before the price editor is built |

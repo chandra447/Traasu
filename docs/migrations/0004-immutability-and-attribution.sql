@@ -80,3 +80,5 @@ END;
 CREATE INDEX IF NOT EXISTS idx_bill_lines_override_live
   ON bill_lines(bill_id, price_source)
   WHERE price_source IN ('override', 'manual');
+
+UPDATE schema_meta SET schema_version = 4 WHERE id = 1;

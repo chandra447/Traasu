@@ -211,3 +211,21 @@ The three that will bite first, in order:
   plans on 10 million are not the same claim.
 - No load test of the per-bill push against a real D1.
 - The mermaid ER was parsed by mermaid's own parser (schema agent), not rendered in this repo's viewer.
+
+## H. Architecture review, 2026-11-14
+
+`review-architecture.md` ran against the design after D17–D21, with experiments on real D1. Its five failure
+sequences and fifteen contradictions are closed by migration 0008, the rewritten 0007, the revised D12–D21
+and the new D22–D25; the review lists each one with where it was closed.
+
+Changes to this file's earlier rulings:
+
+- §C "Per-store D1 registry and R2 archive — with the sharding decision": R2 archival is v1 (D22); the
+  store-group split stays the fallback (D18).
+- §C "Argon2id for owner passwords": moot; Better Auth hashes with scrypt (D17).
+- §C "Owner TOTP MFA": Better Auth `twoFactor`; table `auth_two_factor` (0007).
+- §C "Two-step enrolment": in the route table now (D5 revision).
+- §F open items closed by D25: D30, D33, D42, D44, D45, D46. D16/D17 price revisions remain open, to be
+  decided before the price editor is built.
+- §G "No EXPLAIN against a seeded, large database": bytes per bill and archival delete cost are now
+  measured on real D1; query plans are still checked on a small seed (`explain-queries.py`).
