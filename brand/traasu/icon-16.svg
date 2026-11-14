@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- 16px icon: the T alone. The fulcrum sits on top of the beam so it stays
+       visible when the glyph is rasterised down to 16 device pixels. -->
+  <g fill="#731328">
+    <rect x="1" y="4" width="14" height="3.2"/>
+    <rect x="6.4" y="4" width="3.2" height="10"/>
+  </g>
+  <circle cx="8" cy="2.4" r="1.7" fill="#FEC40B"/>
+</svg>
