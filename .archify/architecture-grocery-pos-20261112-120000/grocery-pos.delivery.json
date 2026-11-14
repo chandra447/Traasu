@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "ff0e8f00-154e-45a0-adcb-a6a8fa8feb27",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/Users/chandrateja/pos-design/.archify/architecture-grocery-pos-20261112-120000/candidate.json",
+  "output": "/Users/chandrateja/pos-design/.archify/architecture-grocery-pos-20261112-120000/grocery-pos.html",
+  "specification": {
+    "sha256": "ddf8cd22860c00db7c0deff2cef0c169faba331d8c006b7dff28b5335f1216ce",
+    "bytes": 5133
+  },
+  "artifact": {
+    "sha256": "f96ba0fd6d480b8a13b947c5e09f723ddc6e362669e27d67664db87e81764101",
+    "bytes": 848027
+  }
+}

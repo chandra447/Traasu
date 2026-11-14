@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "architecture",
+  "quality": "showcase",
+  "specification": {
+    "path": "/Users/chandrateja/pos-design/.archify/architecture-grocery-pos-20261112-120000/candidate.json",
+    "sha256": "771e750d46eeef7e05d27248757f9b6b532ca798fcf78bf051e25321c4372ce0",
+    "bytes": 3270
+  },
+  "artifact": {
+    "path": "/Users/chandrateja/pos-design/.archify/architecture-grocery-pos-20261112-120000/grocery-pos.html",
+    "sha256": "47dac586575d8c7bfe1e2891eb4e53f67ce5955100aa762bfd299ffd3058a519",
+    "bytes": 847001
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/Users/chandrateja/pos-design/.archify/architecture-grocery-pos-20261112-120000/grocery-pos.finalize.json",
+    "summaryReceipt": "/Users/chandrateja/pos-design/.archify/architecture-grocery-pos-20261112-120000/grocery-pos.finalize-summary.json",
+    "browserCheckReceipt": "/Users/chandrateja/pos-design/.archify/architecture-grocery-pos-20261112-120000/grocery-pos.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-11-12T10:42:59.421Z",
+    "source": "network",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 8750,
+  "browserCheck": {
+    "requested": true,
+    "ran": true
+  },
+  "layoutReviewRecommendation": {
+    "action": "inspect-leading-space",
+    "evidence": {
+      "measured": true,
+      "emptyTopPx": 270,
+      "emptyTopRatio": 0.452,
+      "occupiedTop": 270,
+      "viewBoxTop": 0,
+      "canvasHeight": 598,
+      "typicalNodeHeight": 60,
+      "reviewSuggested": true
+    },
+    "reason": "Measured content, including routes and labels, leaves a large empty area above the diagram. This is a composition suggestion, not a failed gate.",
+    "repair": "Check whether that leading space is intentional. If not, reposition the connected scene nearer the canvas origin while retaining room for its actual boundaries, labels and return routes. Preserve all meaning and user-fixed geometry, then rerun finalize. No screenshot is required."
+  }
+}

@@ -1,0 +1,26 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# generated / local
+node_modules/
+.wrangler/
+*.db
+*.db-wal
+*.db-shm
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+
+# archify working files (keep the final diagram, drop the run artifacts)
+.archify/**/candidate.json
+.archify/**/*.browser-check.json
+.archify/**/review-*/
