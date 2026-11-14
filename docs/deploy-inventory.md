@@ -1,4 +1,6 @@
-# Deploy inventory — one tenant deployment
+# Deploy inventory — one tenant
+
+> Release flow, version pinning and per-tenant promotion live in [`release-management.md`](release-management.md). deployment
 
 One franchisee = one Cloudflare Worker + one D1 database + one KV namespace + one custom hostname.
 The codebase, migrations and admin SPA build are shared; every runtime resource and every secret is

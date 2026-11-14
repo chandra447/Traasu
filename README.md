@@ -15,6 +15,7 @@ Design only — no application code yet.
 - [`docs/d1-schema.md`](docs/d1-schema.md) — ER diagram and index map
 - [`docs/api-routes.md`](docs/api-routes.md) — the Hono API
 - [`docs/TRIAGE.md`](docs/TRIAGE.md) — what the reviews found and what we did about it
+- [`docs/release-management.md`](docs/release-management.md) — one deployment per enterprise, pinned versions
 
 ## Verify
 
