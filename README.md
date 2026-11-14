@@ -19,7 +19,9 @@ and syncs to Cloudflare when it returns.
 - [`docs/d1-schema.sql`](docs/d1-schema.sql) + [`docs/migrations/`](docs/migrations) — the database
 - [`docs/d1-schema.md`](docs/d1-schema.md) — ER diagram and index map
 - [`docs/api-routes.md`](docs/api-routes.md) — the Hono API
-- [`docs/release-management.md`](docs/release-management.md) — one Worker, one database per enterprise
+- [`docs/auth-better-auth.md`](docs/auth-better-auth.md) — the admin plane
+- [`docs/release-management.md`](docs/release-management.md) — one Worker for every tenant, one database per enterprise
+- [`docs/review-architecture.md`](docs/review-architecture.md) — the 2026-11-14 audit: tenancy, D1 measurements, retention
 - [`docs/TRIAGE.md`](docs/TRIAGE.md) — what the reviews found and what we did about it
 - [`brand/`](brand/) — mark, palette, typography
 
@@ -27,7 +29,9 @@ and syncs to Cloudflare when it returns.
 
 ```sh
 python3 docs/check-schema.py      # DDL + migrations apply; no float money
+python3 docs/check-invariants.py  # triggers refuse the writes they are meant to refuse
 python3 docs/explain-queries.py   # every hot query gets an index
+python3 docs/capacity-bench.py    # bytes per bill on the real schema
 ```
 
-Both must print `ok` and `OK`.
+All must print `ok` or `OK`.

@@ -31,9 +31,11 @@ Why: the security review's F1 — a modified terminal can otherwise write any re
 that makes its discount look in-policy. Rejecting the bill is worse: it loses a real sale. Verify, record both,
 surface the delta.
 
-**Revised 2026-11-14.** `price_minor` and `list_price_minor` are rates per `price_basis_qty_base`, which is
-mandatory on the wire. The old canonical example sent a 1.5 kg line with no basis, which reads as a per-gram
-price and would have flagged every tiered line as `price_mismatch`.
+**Revised 2026-11-14.** On a bill line, `price_minor` and `list_price_minor` are rates per
+`price_basis_qty_base`, which is mandatory on the wire. The old canonical example sent a 1.5 kg line with no
+basis, which reads as a per-gram price and would have flagged every tiered line as `price_mismatch`. Catalog
+tier rows (`item_prices`) stay pack prices: `price_minor` is what `qty_base` costs, and a tiered line's
+`price_breakdown.parts` are those rows, summing to `list_amount_minor`.
 
 ## D3. Offline caps authority, not the sale
 
@@ -397,8 +399,10 @@ schema from there up (`release-management.md`).
 
 ## D22. Archival is v1, behind a per-tenant flag
 
-The owner sets **retention in months** in the admin panel; archival is a per-tenant feature flag
-(`tenant_flags.archival_enabled`). A monthly job per tenant, outside shop hours and in batches of ≤ 500 bills:
+The owner sets **retention in months** in the admin panel; archival is a per-tenant feature flag. Both live
+in META (`tenant_flags.archival_enabled`, `tenant_flags.retention_months`), next to the other per-tenant
+policy that changes without a deploy (D21). A monthly job per tenant, outside shop hours and in batches of
+≤ 500 bills:
 
 1. Export a store-month to R2 (`archive/<tenant>/<store>/<yyyy-mm>.jsonl.gz`: bills, lines, voids).
 2. Verify row counts and Σ totals against D1.
