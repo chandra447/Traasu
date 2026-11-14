@@ -22,7 +22,7 @@ host → binding map. A **control-plane D1** (`env.META`) mirrors it for things 
 deploy — suspension, store limits, feature flags — and records the schema version each tenant actually reached.
 Routing never depends on META; `DECISIONS.md` D21 explains why.
 
-## The registry
+## Files
 
 `infra/tenants.json` — the only file that changes when a customer signs:
 
