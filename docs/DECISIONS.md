@@ -151,3 +151,14 @@ either.
 
 Also corrected: rate-limit counters cannot live in Workers KV (no atomic ops, 60 s minimum TTL). Use D1 or a
 Durable Object.
+
+## D18. One enterprise, one D1; stores are rows (measured, not estimated)
+
+A tenant is an enterprise. Its stores, terminals, cashiers and bills live in one database. There is no
+per-store database and no sharding plan.
+
+Measured on the real schema: 1,067 bytes per bill at 4 lines, including indexes, movements and the daily
+rollup. Five stores at 600 bills/day is 1.17 GB/year, or about 8.6 years to the 10 GB cap; at 10 lines per
+bill it is about 3.4 years. The earlier "10 months" figure was an estimate ten times too high and is withdrawn.
+
+The growth answer is archival: export bills older than the retention window to R2 and keep `sales_daily`.

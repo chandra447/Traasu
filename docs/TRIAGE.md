@@ -142,7 +142,7 @@ catalog payload (B9), and CSV/XSS hygiene (B10). These live in Go and the admin 
 
 | Item | Trigger |
 |---|---|
-| Shard D1 by store (sync #17) | any tenant projecting > 2 GB/year, or 5 stores at 600 bills/day — decide before the first tenant, it is a one-way door |
+| ~~Shard D1 by store (sync #17)~~ | **withdrawn** — measured at 1,067 bytes/bill, a five-store enterprise reaches 10 GB in ~8.6 years. See `capacity.md`. The real task is retention + R2 archival, not sharding |
 | Read-replication sessions / `first-primary` (sync #19) | only if read replication is enabled for a tenant |
 | Argon2id for owner passwords (security) | before the second tenant; PBKDF2 is acceptable for one |
 | Owner TOTP MFA | before go-live for any tenant with real money |
