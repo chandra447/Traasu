@@ -1,149 +1,133 @@
-# Release management — one deployment per enterprise
+# Release management — one Worker, one database per enterprise
 
-Model: **one enterprise = one Worker + one D1 + one KV.** Reliance and Coles are separate deployments with
-separate databases. They do not share code paths at runtime, and they do not share a release schedule — each
-tenant is pinned to a version and promoted by hand.
+Compute is pooled; data is sharded. One Worker serves every tenant, routed by hostname. Each enterprise gets
+its own D1 because the 10 GB cap is per database and cannot be raised (`DECISIONS.md` D19, D20).
+
+The result is one deploy, one secret set, one cron, one rollback — and N databases that a script migrates.
 
 ```mermaid
 flowchart LR
-    subgraph Repo["One repo, one codebase"]
-        Tag["Tag v1.4.2"] --> CI["GitHub Actions"]
-    end
-    CI -->|"workflow_dispatch<br/>tenant + ref"| Gate{"Environment approval<br/>tenant-reliance"}
-    Gate -->|approved| Mig["D1 migrations apply<br/>(that tenant only)"]
-    Mig --> Dep["wrangler deploy<br/>(that tenant only)"]
-    Dep --> Smoke["GET /health<br/>version + schema_version"]
-    Smoke --> Reg["versions.json<br/>updated by PR"]
-    Gate -->|rejected| Stop["nothing deployed"]
+    Merge["merge to main"] --> Stg["deploy staging<br/>(auto)"]
+    Stg --> Can["deploy canary<br/>(auto, 1 real shop)"]
+    Can -->|"soak 7 days"| Prod["deploy production<br/>(one click)"]
+    Prod --> Mig["migrate N databases<br/>canary first, stop on failure"]
+    Mig --> Smoke["/health per tenant"]
+    Smoke --> Reg["record versions.json"]
 ```
 
-## The registry is the source of truth
+## The registry
 
-Two files, both in the repo, both reviewed by PR:
-
-`infra/tenants/reliance.json`
+`infra/tenants.json` — the only file that changes when a customer signs:
 
 ```json
-{
-  "slug": "reliance",
-  "tenant_id": "tnt_reliance",
-  "app_id": "pos-prod",
-  "worker": "pos-api-reliance",
-  "d1_id": "8f2c…",
-  "kv_id": "a91b…",
-  "stores_expected": 10,
-  "support_contact": "ops@reliance.example"
-}
+[
+  { "slug": "reliance", "host": "reliance.pos.app", "tenant_id": "tnt_reliance",
+    "d1_id": "8f2c…", "stores_expected": 10 },
+  { "slug": "coles", "host": "coles.pos.app", "tenant_id": "tnt_coles",
+    "d1_id": "a91b…", "stores_expected": 10 }
+]
 ```
 
-`infra/versions.json`
+`infra/versions.json` — written by the pipeline after a green smoke test:
 
 ```json
-{
-  "reliance": { "tag": "v1.4.2", "schema": 7, "deployed_at": "2026-11-20T09:14:00Z", "by": "chandra" },
-  "coles":    { "tag": "v1.3.0", "schema": 6, "deployed_at": "2026-11-11T16:02:00Z", "by": "chandra" }
-}
+{ "worker": "v1.4.2", "schema": 7, "deployed_at": "2026-11-20T09:14:00Z",
+  "tenants": { "reliance": { "schema": 7 }, "coles": { "schema": 7 } } }
 ```
 
-Deploying is a **tag**, never a branch. `versions.json` is written by the pipeline after a successful smoke
-test, so the file always describes what is actually running. A tenant missing from the file is a tenant nobody
-has deployed — which is a state worth being able to see.
+One version for everyone, because everyone moves together. The per-tenant entry records only what the
+migration loop actually reached, which is what you need when it stops halfway.
 
-## Manual promotion, per tenant
+## Deploy
 
 ```yaml
-name: deploy-tenant
+name: deploy
 on:
+  push: { branches: [main] }
   workflow_dispatch:
     inputs:
-      tenant: { required: true, type: choice, options: [reliance, coles, staging] }
-      ref:    { required: true, type: string, description: "tag, e.g. v1.4.2" }
-      apply_migrations: { required: true, type: boolean, default: false }
+      stage: { type: choice, options: [staging, canary, production], default: staging }
 
 jobs:
   deploy:
-    environment: "tenant-${{ inputs.tenant }}"   # GitHub holds the approval here
-    concurrency: "deploy-${{ inputs.tenant }}"   # one deploy per tenant at a time
+    environment: ${{ inputs.stage || 'staging' }}
+    concurrency: deploy-${{ inputs.stage || 'staging' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { ref: "${{ inputs.ref }}" }
-      - run: node infra/check-compat.mjs --tenant "${{ inputs.tenant }}" --ref "${{ inputs.ref }}"
-      - if: inputs.apply_migrations
-        run: npx wrangler d1 migrations apply "${{ inputs.tenant }}" --remote
-      - run: npx wrangler deploy --config "infra/generated/${{ inputs.tenant }}.toml"
-      - run: node infra/smoke.mjs --tenant "${{ inputs.tenant }}" --expect "${{ inputs.ref }}"
-      - run: node infra/record-version.mjs --tenant "${{ inputs.tenant }}" --ref "${{ inputs.ref }}"
+      - run: npx wrangler deploy
+      - run: node infra/smoke.mjs --stage "${{ inputs.stage || 'staging' }}"
 ```
 
-Three properties matter here:
+One job. No matrix, no per-tenant environment, no per-tenant secret. Rollback is `wrangler rollback` — seconds,
+because it is one deployment.
 
-- **`environment:`** is the approval gate. Each tenant gets its own GitHub environment with its own reviewers,
-  so promoting Reliance cannot promote Coles.
-- **`concurrency:`** stops two deploys landing on the same tenant at once.
-- **`apply_migrations` is a separate, explicit boolean.** A code-only release must be possible without touching
-  the schema, or every hotfix becomes a migration risk.
+## Migrate
 
-## Migrations are the hard part
+Migrations are the only per-tenant operation, so they get their own workflow and their own approval:
 
-Workers and D1 do not roll back together. Code rolls back in seconds; a migration does not roll back at all.
-So the rule is **expand → migrate → contract**, one release apart:
+```yaml
+name: migrate
+on:
+  workflow_dispatch:
+    inputs:
+      stage: { type: choice, options: [staging, canary, production], default: staging }
+
+jobs:
+  migrate:
+    environment: migrate-${{ inputs.stage }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: node infra/migrate.mjs --stage "${{ inputs.stage }}"
+```
+
+`infra/migrate.mjs` reads `tenants.json`, orders canary first, runs
+`wrangler d1 migrations apply <db> --remote` per tenant, records each result in `versions.json`, and **stops on
+the first failure** rather than continuing to the rest. A half-migrated fleet is recoverable; a fleet migrated
+past a broken step is not.
+
+## Onboarding a customer
+
+Four commands, one PR:
+
+```sh
+node infra/onboard.mjs --slug reliance --stores 10   # creates D1, appends tenants.json
+npx wrangler d1 migrations apply pos-reliance --remote
+git commit -am "add reliance" && git push            # pipeline deploys the Worker with the new binding
+```
+
+The Worker picks up the new tenant on deploy because routing is generated from `tenants.json` at build time.
+No code change, no new workflow, no new environment.
+
+## Migrations still follow expand → contract
+
+One Worker means every tenant runs the same code, which makes schema changes *easier*, not harder: there is no
+version skew between code and schema across tenants. The rule stays because a migration is still irreversible:
 
 | Release | Schema | Code |
 |---|---|---|
-| N | add `bills.customer_phone` (nullable) | writes both old and new shapes |
-| N+1 | nothing | reads the new column, stops writing the old shape |
-| N+2 | drop the old column | — |
+| N | add nullable column | writes old and new shapes |
+| N+1 | — | reads new, stops writing old |
+| N+2 | drop old column | — |
 
-This is what makes it safe for Reliance to sit on `v1.3.0` while Coles runs `v1.4.2` against the same
-migration history. A migration that the previous release cannot run against is a bug, not a rollout detail.
+The one skew that remains is **tenant against tenant**: Reliance may be at schema 7 while Coles is at 6 if the
+loop stopped. The Worker must therefore read only columns that exist in the oldest supported schema. That is
+what expand/contract guarantees.
 
-`infra/check-compat.mjs` enforces the mechanical half: it reads the tag's declared `schema_version` and refuses
-to deploy if the tenant's `schema_meta.schema_version` is ahead of it.
+## What replaces per-tenant pinning
 
-## Drift is the thing that will bite
+Nothing, and that is deliberate. If a customer contracts for version isolation, give that tenant its own
+Worker and its own workflow — a per-tenant exception, not the default. The code is identical; only the
+deployment differs.
 
-Twenty tenants on twenty versions is twenty code paths to reason about. Two guards:
+## Failure modes
 
-1. **Support window of two minor versions.** A tenant more than two minors behind is out of support; the
-   pipeline warns, and after the third it refuses a migration until the tenant is brought forward.
-2. **A nightly drift job** that calls `/health` on every tenant and opens one issue listing tenants whose
-   `build` differs from `versions.json`. Not an alert per tenant — one issue, edited in place.
-
-## Rollback
-
-- **Code:** redeploy the previous tag through the same workflow. Minutes.
-- **Schema:** forward only. If a migration is wrong, ship a new migration that repairs it. This is why the
-  expand/contract rule exists — it keeps the previous Worker runnable against the current schema.
-- **Data:** D1 Time Travel, 30 days, per database. Restoring bumps `sync_epoch`, and every terminal
-  full-resyncs. Rehearse this on staging before Reliance needs it.
-
-## What each tenant owns
-
-| Thing | Per tenant | Consequence |
+| Event | Blast radius | Response |
 |---|---|---|
-| Worker | yes | a bad deploy breaks one enterprise, not all |
-| D1 | yes | 10 GB each; measured at ~1,067 bytes/bill (`capacity.md`) |
-| KV | yes | revocation and rate-limit counters |
-| JWT signing key | yes | a token minted for Reliance is invalid at Coles |
-| Google OAuth client | yes | separate redirect URI per tenant |
-| Release cadence | yes | pinned in `versions.json` |
-
-Shared: DNS, the pipeline, monitoring. A DNS mistake takes down every tenant at once; a deploy mistake takes
-down one.
-
-## Why not pool everything into one database
-
-Because a pooled D1 hits its unraisable 10 GB cap in 312 days at five enterprises, and 78 days at twenty.
-The arithmetic is in `DECISIONS.md` D19. Pooling buys one deploy and one migration; it costs the database and
-the blast radius.
-
-## First three tenants, concretely
-
-1. **staging** — your own, deployed on every merge to `main`. No approval gate. This is where migrations are
-   rehearsed.
-2. **canary** — one real shop you control. Gets a release a week before anyone else.
-3. **reliance** — first customer, pinned to whatever canary has survived for a week.
-
-Coles is the same procedure as Reliance with a different JSON file. If onboarding a tenant needs a code change,
-the model is wrong.
+| Bad Worker deploy | every tenant | `wrangler rollback`, seconds |
+| Bad migration, canary first | canary only | fix forward; other tenants untouched |
+| Bad migration reaching production | every tenant | restore from Time Travel, bump `sync_epoch`, terminals full-resync |
+| One tenant's traffic spike | none | Workers scale per request; its D1 is its own |
+| D1 binding limit | — | thousands per Worker; irrelevant at this scale |
+| Secret rotation | every tenant | one secret, HKDF derives per-tenant keys |

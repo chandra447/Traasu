@@ -52,11 +52,11 @@ ears, and the base pushes the mark slightly toward a trophy.
 
 ## Recommendation
 
-Develop **C**. It is the only candidate that reads as a balance scale at 512
-without explanation, and its weight sits in solid blocks — discs, beam and base —
-rather than in thin hangs, so the 16 px and 1-bit versions degrade gracefully.
-A is the better pure monogram if the balance reference is judged too oblique;
-B needs its pans redrawn before it is more than a sketch.
+Develop **C**. It reads as a balance scale at 512 most clearly, and its weight
+sits in solid blocks — discs, beam and base — rather than in thin hangs, so the
+16 px and 1-bit versions degrade gracefully. A is the better pure monogram if the
+balance reference is judged too oblique; B needs its pans redrawn before it is
+more than a sketch.
 
 ## Rejected
 

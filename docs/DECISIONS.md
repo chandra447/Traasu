@@ -196,3 +196,55 @@ release path than twenty ordinary Workers.
 At ten to twenty tenants, per-tenant Workers are the simplest thing that satisfies isolation *and* pinning.
 Revisit at roughly fifty tenants, or when the deploy matrix itself becomes the bottleneck; the handlers are
 already tenant-agnostic, so that move is a deployment change, not a rewrite.
+
+## D20. One Worker, N databases — compute pooled, data sharded
+
+D19 settled the data plane: one D1 per enterprise, because the 10 GB cap is per database and pooling fills it
+in under a year. It did **not** settle the compute plane. Running one Worker per tenant was the first answer,
+and it is the wrong default for a two-person team: twenty Workers, twenty secrets, twenty environments and
+twenty release paths is hand-holding, not isolation.
+
+Revised default:
+
+| Plane | Shape | Why |
+|---|---|---|
+| Compute | **one Worker**, routed by hostname | one deploy, one secret set, one cron, one rollback |
+| Data | **one D1 per enterprise** | the cap forces it; measured in `capacity.md` |
+| KV | one namespace, tenant-prefixed keys | one resource |
+| Signing key | one master secret, per-tenant key via HKDF(master, tenant_id) | one secret to rotate; a token minted for A still fails at B |
+| OAuth | one Google client, per-tenant redirect URI | one console |
+| Cron | one trigger, loops tenants | one schedule |
+
+Routing is a static map generated at build time from `infra/tenants/*.json`, so adding a tenant is a data
+change plus a redeploy, not a code change:
+
+```ts
+const TENANTS: Record<string, keyof Env> = {
+  "reliance.pos.app": "DB_RELIANCE",
+  "coles.pos.app":    "DB_COLES",
+};
+```
+
+A Worker can hold thousands of D1 bindings, so this holds well past the tenant count where it stops mattering.
+
+### What is given up
+
+**Per-tenant version pinning.** Every tenant moves together on one deploy. That is the price of one release
+path, and it is the right price for ten to twenty tenants. Buy back the risk with stages, not with versions:
+
+- `staging` — every merge to main.
+- `canary` — one real shop, a week ahead.
+- everyone else — after canary survives.
+
+**Blast radius.** A bad deploy hits every tenant at once. Mitigated by `wrangler rollback` (seconds), the
+expand/contract migration rule, and the canary stage. A bad *migration* is the dangerous one, so migrations run
+canary-first and stop on the first failure.
+
+### The exception that keeps the door open
+
+If a customer ever contracts for version isolation — Reliance plausibly will — give **that tenant** its own
+Worker and its own release path. The handlers are tenant-agnostic and the code is identical, so the exception
+costs a second workflow, not a second codebase. Default simple, exception possible.
+
+Revisit at roughly a hundred tenants, where Workers for Platforms (one upload, per-tenant script instances)
+beats both.
