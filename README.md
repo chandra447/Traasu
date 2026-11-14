@@ -1,11 +1,16 @@
-# Traasu
+<p align="center">
+  <img src="brand/traasu/lockup-bg.svg" alt="Traasu" width="440">
+</p>
 
-**Bill sariga undali.** — *Every bill, weighed right.*
+<h3 align="center">Bill sariga undali. — <em>Every bill, weighed right.</em></h3>
 
-Offline-first billing for Telugu grocery and department stores. Records every bill, reports per item per day
-and per month, keeps billing when the network drops, and syncs to Cloudflare when it returns.
+<p align="center">
+Offline-first billing for Telugu grocery and department stores.<br>
+Records every bill, reports per item per day and per month, keeps billing when the network drops,<br>
+and syncs to Cloudflare when it returns.
+</p>
 
-Design only — no application code yet.
+<p align="center"><em>Design only — no application code yet.</em></p>
 
 ## What's here
 
@@ -14,8 +19,9 @@ Design only — no application code yet.
 - [`docs/d1-schema.sql`](docs/d1-schema.sql) + [`docs/migrations/`](docs/migrations) — the database
 - [`docs/d1-schema.md`](docs/d1-schema.md) — ER diagram and index map
 - [`docs/api-routes.md`](docs/api-routes.md) — the Hono API
+- [`docs/release-management.md`](docs/release-management.md) — one Worker, one database per enterprise
 - [`docs/TRIAGE.md`](docs/TRIAGE.md) — what the reviews found and what we did about it
-- [`docs/release-management.md`](docs/release-management.md) — one deployment per enterprise, pinned versions
+- [`brand/`](brand/) — mark, palette, typography
 
 ## Verify
 
