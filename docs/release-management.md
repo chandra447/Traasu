@@ -15,6 +15,13 @@ flowchart LR
     Smoke --> Reg["record versions.json"]
 ```
 
+## The registry, and the control plane
+
+`infra/tenants.json` is authoritative for routing: it is reviewed in a PR, and the build compiles it into the
+host → binding map. A **control-plane D1** (`env.META`) mirrors it for things that must change without a
+deploy — suspension, store limits, feature flags — and records the schema version each tenant actually reached.
+Routing never depends on META; `DECISIONS.md` D21 explains why.
+
 ## The registry
 
 `infra/tenants.json` — the only file that changes when a customer signs:

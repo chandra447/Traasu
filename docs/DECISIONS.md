@@ -248,3 +248,56 @@ costs a second workflow, not a second codebase. Default simple, exception possib
 
 Revisit at roughly a hundred tenants, where Workers for Platforms (one upload, per-tenant script instances)
 beats both.
+
+## D21. A control-plane D1 holds tenant metadata; it cannot hold the routing table
+
+The ask: Hono keeps the tenant → database map in a metadata D1. Half of that is right, and the other half is
+blocked by how D1 works.
+
+**D1 is binding-only.** A Worker reaches a database through a binding declared in its Wrangler config
+(`env.DB_RELIANCE`). There is no runtime call that opens a database by id. So a metadata table can *say*
+"reliance → 8f2c…", but the Worker still cannot reach 8f2c… unless a binding for it was deployed. Routing stays
+a build artifact.
+
+What the control-plane D1 is genuinely for:
+
+| Table | Holds | Read by |
+|---|---|---|
+| `tenants` | slug, host, tenant_id, binding name, plan, store limit, status | onboarding, admin |
+| `tenant_schema` | schema version per tenant, last migration result | migrate workflow, `/health` |
+| `tenant_flags` | feature flags that must change without a deploy | request path, cached |
+| `deploy_log` | tag, tenant, who, when, result | admin, incident review |
+
+### The shape
+
+- `infra/tenants.json` stays **authoritative** — reviewable, diffable, and a deploy is reproducible from a
+  commit. The pipeline syncs it into `tenants` on every deploy.
+- The build generates the routing map from that JSON, so routing is a compiled constant with zero latency.
+- `env.META` is queried only for policy that must change *without* a deploy: suspension, store-limit bumps,
+  feature flags. Cached in KV for 60 s.
+
+### Why not make META the routing source
+
+Three reasons, in order of how much they hurt:
+
+1. **Reproducibility.** If the database is the source of truth, a code rollback does not roll back tenant
+   config, and you cannot diff what changed between two deploys.
+2. **Hot-path dependency.** Routing every request through a second database makes the control plane a single
+   point of failure for all tenants. A static map cannot go down.
+3. **Chicken and egg.** The build would need credentials to read the control database to generate the config
+   that connects to it.
+
+### Failure behaviour
+
+| Event | Behaviour |
+|---|---|
+| META unreachable | routing continues on the static map; policy falls back to the last KV value, then to allow, and alerts |
+| Tenant suspended | takes effect within the 60 s cache window, no deploy |
+| New tenant added | needs a deploy, because a binding is a deploy-time object |
+| META database lost | rebuild from `infra/tenants.json`; nothing else is authoritative |
+
+### If zero-redeploy onboarding ever matters
+
+The only Cloudflare-native way to add a tenant without touching the Worker config is **Workers for
+Platforms** — each tenant gets its own script instance with its own bindings, and a dispatcher routes by host.
+That is the answer at a hundred tenants, not at ten. A metadata D1 is not a substitute for it.
