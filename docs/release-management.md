@@ -132,6 +132,12 @@ Twenty tenants on twenty versions is twenty code paths to reason about. Two guar
 Shared: DNS, the pipeline, monitoring. A DNS mistake takes down every tenant at once; a deploy mistake takes
 down one.
 
+## Why not pool everything into one database
+
+Because a pooled D1 hits its unraisable 10 GB cap in 312 days at five enterprises, and 78 days at twenty.
+The arithmetic is in `DECISIONS.md` D19. Pooling buys one deploy and one migration; it costs the database and
+the blast radius.
+
 ## First three tenants, concretely
 
 1. **staging** — your own, deployed on every merge to `main`. No approval gate. This is where migrations are

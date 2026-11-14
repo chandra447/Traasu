@@ -162,3 +162,37 @@ rollup. Five stores at 600 bills/day is 1.17 GB/year, or about 8.6 years to the 
 bill it is about 3.4 years. The earlier "10 months" figure was an estimate ten times too high and is withdrawn.
 
 The growth answer is archival: export bills older than the retention window to R2 and keep `sales_daily`.
+
+## D19. Sharded by enterprise, not pooled — the arithmetic decides it
+
+Terminology first, because it changes the answer: the current design is already **sharded** — one database per
+enterprise. The alternative is **pooled** — one database, a `tenant_id` on every row. They are not two flavours
+of the same thing.
+
+Measured at 1,067 bytes per bill (`capacity.md`), 600 bills/day/store:
+
+| Tenants | Stores | Bills/day | Growth | Pooled D1 hits 10 GB in |
+|---|---|---|---|---|
+| 5 | 50 | 30,000 | 11.7 GB/year | **312 days** |
+| 10 | 100 | 60,000 | 23.4 GB/year | **156 days** |
+| 20 | 200 | 120,000 | 46.7 GB/year | **78 days** |
+
+The 10 GB cap is per database and cannot be raised. A pooled database is therefore not a design choice that
+survives the first year of selling — it is a countdown. That alone settles it, before the security argument
+(one missing `WHERE tenant_id` is a cross-customer leak) or the write-contention argument (one writer for every
+tenant's evening rush).
+
+What pooling would buy is real, and worth naming: one deploy, one migration, one version, one secret set. That
+is why it is tempting. The cost is a database that fills in under a year and a blast radius that includes every
+customer at once.
+
+### The middle option, and why it is not chosen yet
+
+One Worker with N D1 bindings, routed by hostname, gives per-tenant data isolation with a single code deploy.
+It loses per-tenant version pinning — every tenant moves together — which is a requirement here. Workers for
+Platforms restores pinning with per-tenant script instances, at the cost of a dispatcher and a more complex
+release path than twenty ordinary Workers.
+
+At ten to twenty tenants, per-tenant Workers are the simplest thing that satisfies isolation *and* pinning.
+Revisit at roughly fifty tenants, or when the deploy matrix itself becomes the bottleneck; the handlers are
+already tenant-agnostic, so that move is a deployment change, not a rewrite.
