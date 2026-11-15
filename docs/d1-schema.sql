@@ -1,4 +1,6 @@
--- D1 schema for one tenant: one franchisee, one Worker, one database.
+-- D1 schema for one tenant: one enterprise, one database. One Worker serves every tenant and
+-- picks this database by Host; the auth_* tables (migration 0007) follow Better Auth's
+-- conventions instead of the storage rules below.
 -- Applied from this one file by `wrangler d1 migrations apply` and, unchanged, by the
 -- terminal's Go migration runner to its local SQLite. Where the two sides differ, the
 -- comment says so; nothing is dropped from either copy.
@@ -257,8 +259,8 @@ CREATE TABLE IF NOT EXISTS item_identifiers (
 CREATE TABLE IF NOT EXISTS catalog_changes (
   seq         INTEGER PRIMARY KEY,
   entity      TEXT NOT NULL CHECK (entity IN (
-                'item', 'item_price', 'item_identifier', 'unit', 'tax_rate', 'user',
-                'store', 'store_settings', 'numbering_policy', 'terminal_config')),
+                'item', 'item_price', 'item_identifier', 'item_batch', 'book', 'unit', 'tax_rate',
+                'user', 'store', 'store_settings', 'numbering_policy', 'terminal_config')),
   entity_id   TEXT NOT NULL,
   op          TEXT NOT NULL CHECK (op IN ('upsert', 'delete')),
   version     INTEGER CHECK (version IS NULL OR version > 0),
@@ -464,15 +466,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_entity
 
 
 -- ---------------------------------------------------------------------------
--- Seed rows. Idempotent: provisioning may be re-run against an existing database.
--- The owner account is NOT seeded (it needs a password hash); it is created by the
--- one-time bootstrap call before the first enrolment code.
+-- Seed rows: reference data only. Idempotent: provisioning may be re-run against an
+-- existing database. Tenant-specific rows (first store, settings, terminal, numbering
+-- policy, terminal config, owner) are NOT seeded here: provisioning inserts them with
+-- random UUIDv7 ids and appends their catalog_changes rows. Fixed ids would be identical
+-- in every tenant's database, so a token's store/terminal claims would resolve in any of
+-- them (docs/review-architecture.md, failure 1).
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO schema_meta (id, schema_version, tenant_id, app_id, provisioned_at)
 VALUES (1, 1, 'tnt_REPLACE', 'app_REPLACE', unixepoch());
 
-INSERT OR IGNORE INTO catalog_seq (id, last_seq, pruned_below) VALUES (1, 14, 0);
+INSERT OR IGNORE INTO catalog_seq (id, last_seq, pruned_below) VALUES (1, 10, 0);
 
 INSERT OR IGNORE INTO units (unit, unit_group, precision, factor_to_base) VALUES
   ('g',   'mass',   0, 1),
@@ -488,39 +493,19 @@ INSERT OR IGNORE INTO tax_rates (id, name, rate_bp) VALUES
   ('0192f3c0-0000-7000-8100-000000000004', 'GST 18%', 1800),
   ('0192f3c0-0000-7000-8100-000000000005', 'GST 28%', 2800);
 
-INSERT OR IGNORE INTO stores (id, name, created_at) VALUES
-  ('0192f3c0-0000-7000-8200-000000000001', 'Main store', unixepoch());
-
-INSERT OR IGNORE INTO store_settings (store_id, business_day_start_minutes, rounding_mode, updated_at)
-VALUES ('0192f3c0-0000-7000-8200-000000000001', 0, 'none', unixepoch());
-
-INSERT OR IGNORE INTO terminals (id, store_id, name, created_at) VALUES
-  ('0192f3c0-0000-7000-8200-000000000002',
-   '0192f3c0-0000-7000-8200-000000000001', 'Counter 1', unixepoch());
-
-INSERT OR IGNORE INTO numbering_policy
-  (id, store_id, scope, terminal_id, prefix, padding, reset_cadence, next_value, updated_at)
-VALUES
-  ('0192f3c0-0000-7000-8200-000000000003',
-   '0192f3c0-0000-7000-8200-000000000001', 'store', NULL, 'INV', 6, 'yearly', 1, unixepoch());
-
-INSERT OR IGNORE INTO terminal_config (terminal_id, version, config_json, updated_at) VALUES
-  ('0192f3c0-0000-7000-8200-000000000002', 1, '{}', unixepoch());
-
 -- Seeds are catalog rows too: a terminal whose cursor is 0 must learn about them through the
--- same log as everything else, so there is no "full snapshot" special case on first pull.
-INSERT OR IGNORE INTO catalog_changes (seq, entity, entity_id, op, version, changed_at) VALUES
-  (1,  'unit', 'g',   'upsert', NULL, unixepoch()),
-  (2,  'unit', 'kg',  'upsert', NULL, unixepoch()),
-  (3,  'unit', 'ml',  'upsert', NULL, unixepoch()),
-  (4,  'unit', 'l',   'upsert', NULL, unixepoch()),
-  (5,  'unit', 'pcs', 'upsert', NULL, unixepoch()),
-  (6,  'tax_rate', '0192f3c0-0000-7000-8100-000000000001', 'upsert', NULL, unixepoch()),
-  (7,  'tax_rate', '0192f3c0-0000-7000-8100-000000000002', 'upsert', NULL, unixepoch()),
-  (8,  'tax_rate', '0192f3c0-0000-7000-8100-000000000003', 'upsert', NULL, unixepoch()),
-  (9,  'tax_rate', '0192f3c0-0000-7000-8100-000000000004', 'upsert', NULL, unixepoch()),
-  (10, 'tax_rate', '0192f3c0-0000-7000-8100-000000000005', 'upsert', NULL, unixepoch()),
-  (11, 'store', '0192f3c0-0000-7000-8200-000000000001', 'upsert', NULL, unixepoch()),
-  (12, 'store_settings', '0192f3c0-0000-7000-8200-000000000001', 'upsert', NULL, unixepoch()),
-  (13, 'numbering_policy', '0192f3c0-0000-7000-8200-000000000003', 'upsert', NULL, unixepoch()),
-  (14, 'terminal_config', '0192f3c0-0000-7000-8200-000000000002', 'upsert', 1, unixepoch());
+-- same log as everything else. Fresh databases only: on a pruned log, re-inserting seqs the
+-- floor says are gone would resurrect them.
+INSERT INTO catalog_changes (seq, entity, entity_id, op, version, changed_at)
+SELECT column1, column2, column3, 'upsert', NULL, unixepoch() FROM (VALUES
+  (1,  'unit', 'g'),
+  (2,  'unit', 'kg'),
+  (3,  'unit', 'ml'),
+  (4,  'unit', 'l'),
+  (5,  'unit', 'pcs'),
+  (6,  'tax_rate', '0192f3c0-0000-7000-8100-000000000001'),
+  (7,  'tax_rate', '0192f3c0-0000-7000-8100-000000000002'),
+  (8,  'tax_rate', '0192f3c0-0000-7000-8100-000000000003'),
+  (9,  'tax_rate', '0192f3c0-0000-7000-8100-000000000004'),
+  (10, 'tax_rate', '0192f3c0-0000-7000-8100-000000000005'))
+WHERE NOT EXISTS (SELECT 1 FROM catalog_changes);

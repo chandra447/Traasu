@@ -71,3 +71,5 @@ END;
 -- ---------------------------------------------------------------------------
 ALTER TABLE bill_lines ADD COLUMN price_store_id TEXT
   CHECK (price_store_id IS NULL OR length(price_store_id) > 0);
+
+UPDATE schema_meta SET schema_version = 3 WHERE id = 1;

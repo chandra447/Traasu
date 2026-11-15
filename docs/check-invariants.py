@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""Assert the money, immutability, void, rollup and archival rules the DDL enforces.
+
+Each case is a sale or a write that the audit (docs/review-architecture.md) showed going
+wrong. Runs the DDL + every migration with foreign keys on, exactly as D1 and the terminal do.
+"""
+import pathlib, sqlite3, sys
+
+here = pathlib.Path(__file__).parent
+con = sqlite3.connect(":memory:", isolation_level=None)
+con.execute("PRAGMA foreign_keys = ON")
+con.executescript((here / "d1-schema.sql").read_text())
+for m in sorted((here / "migrations").glob("*.sql")):
+    con.executescript(m.read_text())
+
+con.executescript("""
+INSERT INTO stores (id, name, created_at) VALUES ('s1', 'S1', 0), ('s2', 'S2', 0);
+INSERT INTO terminals (id, store_id, name, created_at) VALUES ('t1', 's1', 'T1', 0);
+INSERT INTO users (id, name, role, created_at) VALUES ('u1', 'Cashier', 'cashier', 0);
+INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, updated_at)
+VALUES ('i1', 'Dal', 'count', 'fixed_only', 'pcs', 'pcs', 0),
+       ('i2', 'Oil', 'count', 'fixed_only', 'pcs', 'pcs', 0);
+INSERT INTO staff_sessions (id, user_id, store_id, terminal_id, auth_method, started_at)
+VALUES ('ss1', 'u1', 's1', 't1', 'pin_offline', 1000);
+""")
+
+seq = [0]
+
+
+def line(no, item="i1", total=1029, taxable=980, cgst=24, sgst=25, igst=0, list_amount=None, discount=0,
+         stock=(None, None, None)):
+    return dict(no=no, item=item, total=total, taxable=taxable, cgst=cgst, sgst=sgst, igst=igst,
+                list_amount=total + discount if list_amount is None else list_amount, discount=discount, stock=stock)
+
+
+def push(bill_id, lines, total=None, subtotal=None, tax=None, rounding=0, created_at=1500, date="2026-11-14",
+         session="ss1"):
+    """One bill exactly as the Worker batches it: deferred FKs, lines, header last."""
+    seq[0] += 1
+    total = sum(l["total"] for l in lines) + rounding if total is None else total
+    subtotal = sum(l["taxable"] for l in lines) if subtotal is None else subtotal
+    tax = sum(l["cgst"] + l["sgst"] + l["igst"] for l in lines) if tax is None else tax
+    con.execute("BEGIN")
+    try:
+        con.execute("PRAGMA defer_foreign_keys = on")
+        for l in lines:
+            con.execute(
+                """INSERT INTO bill_lines (bill_id, line_no, item_id, item_name, dimension, qty_base, price_version,
+                     price_source, list_price_minor, price_minor, price_basis_qty_base, discount_minor, list_amount_minor,
+                     price_breakdown, line_total_minor, taxable_minor, tax_rate_bp, cgst_minor, sgst_minor, cess_minor,
+                     igst_minor, stock_item_id, stock_batch_id, stock_qty_base)
+                   VALUES (?, ?, ?, 'x', 'count', 1, 1, 'list', ?, ?, 1, ?, ?, '{}', ?, ?, 500, ?, ?, 0, ?, ?, ?, ?)
+                   ON CONFLICT (bill_id, line_no) DO NOTHING""",
+                (bill_id, l["no"], l["item"], l["list_amount"], l["list_amount"], l["discount"], l["list_amount"],
+                 l["total"], l["taxable"], l["cgst"], l["sgst"], l["igst"], *l["stock"]))
+        con.execute(
+            """INSERT INTO bills (id, store_id, terminal_id, user_id, auth_method, business_date, local_seq, display_no,
+                 total_minor, subtotal_minor, tax_minor, rounding_minor, created_at, staff_session_id)
+               VALUES (?, 's1', 't1', 'u1', 'pin_offline', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (id) DO NOTHING""",
+            (bill_id, date, seq[0], f"d{seq[0]}", total, subtotal, tax, rounding, created_at, session))
+        con.execute("COMMIT")
+        return "OK"
+    except sqlite3.Error as e:
+        con.execute("ROLLBACK")
+        return str(e)
+
+
+def write(sql, *args):
+    try:
+        con.execute(sql, args)
+        return "OK"
+    except sqlite3.Error as e:
+        return str(e)
+
+
+def rollup(item="i1"):
+    return con.execute("SELECT qty_base, amount_minor, bill_count FROM sales_daily WHERE item_id = ?",
+                       (item,)).fetchone()
+
+
+failures = 0
+
+
+def expect(label, got, want):
+    global failures
+    ok = got == want
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} {label}: {got}" + ("" if ok else f"   (want {want})"))
+
+
+# Money (D23)
+expect("5% inclusive 1029 split cgst=24 sgst=25", push("b1", [line(1)]), "OK")
+expect("same line split 25/25 (sum 1030)", push("b2", [line(1, cgst=25, sgst=25)]), "line_total_identity")
+expect("split 23/26 violates floor rule", push("b3", [line(1, cgst=23, sgst=26)]), "tax_split_rule")
+expect("IGST line, total includes the tax", push("b4", [line(1, total=11800, taxable=10000, cgst=0, sgst=0,
+                                                          igst=1800)]), "OK")
+expect("IGST plus CGST on one line", push("b5", [line(1, total=13600, taxable=10000, cgst=900, sgst=900,
+                                                      igst=1800)]), "tax_split_conflict")
+expect("discount with list_amount 0 (old bypass)", push("b6", [line(1, list_amount=0, discount=99999)]),
+       "discount_identity")
+expect("line discount reconciles", push("b7", [line(1, discount=100)]), "OK")
+expect("header total 1 against a 1029 line", push("b8", [line(1)], total=1, subtotal=0, tax=1),
+       "bill_lines_mismatch")
+expect("header tax at invoice level (458) vs lines (459)",
+       push("b9", [line(1, total=1001, taxable=848, cgst=76, sgst=77),
+                   line(2, total=1001, taxable=848, cgst=76, sgst=77),
+                   line(3, total=1001, taxable=848, cgst=76, sgst=77)],
+            total=3003, subtotal=2545, tax=458), "bill_lines_mismatch")
+expect("bill with no lines", push("b10", [], total=0, subtotal=0, tax=0), "bill_lines_mismatch")
+expect("nearest-rupee rounding on top of lines", push("b11", [line(1)], rounding=-29), "OK")
+
+# Staff sessions (D16): accepted, the Worker flags; never aborted
+expect("bill 2 s before session start (clock step)", push("b12", [line(1)], created_at=998), "OK")
+write("UPDATE staff_sessions SET ended_at = 2000, end_reason = 'switch_user' WHERE id = 'ss1'")
+expect("cart finished after switch-user", push("b13", [line(1)], created_at=2005), "OK")
+expect("session close is one-way", write("UPDATE staff_sessions SET ended_at = 3000 WHERE id = 'ss1'"),
+       "session_already_closed")
+
+# Rollup (D13) is trigger-maintained and replay-safe
+before = rollup()
+expect("replay of b1 is a no-op", push("b1", [line(1)]), "OK")
+expect("rollup unchanged by replay", rollup(), before)
+
+# Voids (D25)
+expect("bill inserted as voided", write(
+    """INSERT INTO bills (id, store_id, terminal_id, user_id, auth_method, business_date, local_seq, display_no,
+         total_minor, voided, voided_at, voided_by) VALUES ('bv', 's1', 't1', 'u1', 'pin_offline', '2026-11-14', 99,
+         'dv', 0, 1, 1, 'u1')"""), "void_via_bill_voids")
+qty, amt, cnt = rollup()
+expect("void from another store", write(
+    "INSERT INTO bill_voids (id, bill_id, store_id, terminal_id, user_id, reason, created_at) "
+    "VALUES ('v0', 'b1', 's2', 't1', 'u1', 'wrong', 3000)"), "void_store_mismatch")
+expect("void b1", write("INSERT INTO bill_voids (id, bill_id, store_id, terminal_id, user_id, reason, created_at) "
+                        "VALUES ('v1', 'b1', 's1', 't1', 'u1', 'customer left', 3000)"), "OK")
+expect("void flips the bill flag",
+       con.execute("SELECT voided, voided_by, void_reason FROM bills WHERE id = 'b1'").fetchone(),
+       (1, "u1", "customer left"))
+expect("void decrements the rollup", rollup(), (qty - 1, amt - 1029, cnt - 1))
+expect("un-void", write("UPDATE bills SET voided = 0, voided_at = NULL, voided_by = NULL, void_reason = NULL "
+                        "WHERE id = 'b1'"), "void_immutable")
+
+# Immutability and archival (D15, D22)
+expect("delete a bill inside retention", write("DELETE FROM bills WHERE id = 'b7'"), "bill_not_archivable")
+expect("line delete", write("DELETE FROM bill_lines WHERE bill_id = 'b7'"), "bill_line_immutable")
+expect("delete a device", write(
+    "INSERT INTO devices (id, store_id, terminal_id, name, credential_prefix, credential_hash, install_id, "
+    "enrolled_at) VALUES ('d1', 's1', 't1', 'D', 'p', 'h', 'i', 0)") + "/" + write("DELETE FROM devices WHERE id = 'd1'"),
+       "OK/device_deactivate_only")
+rollup_rows = con.execute("SELECT COUNT(*) FROM sales_daily").fetchone()
+write("UPDATE schema_meta SET archive_before = '2026-12-01' WHERE id = 1")
+expect("archive: voids first, then bills", write("DELETE FROM bill_voids WHERE bill_id = 'b1'") + "/" +
+       write("DELETE FROM bills WHERE business_date < '2026-12-01'"), "OK/OK")
+expect("archive leaves no lines behind", con.execute("SELECT COUNT(*) FROM bill_lines").fetchone(), (0,))
+expect("archive keeps sales_daily", con.execute("SELECT COUNT(*) FROM sales_daily").fetchone(), rollup_rows)
+
+# Item and price versions (D26)
+expect("item edit without a version bump", write("UPDATE items SET name = 'Dal Premium' WHERE id = 'i1'"),
+       "item_version_not_bumped")
+expect("item edit with a version bump", write("UPDATE items SET name = 'Dal Premium', version = 2 WHERE id = 'i1'"),
+       "OK")
+expect("terminal replays the same item version", write(
+    "UPDATE items SET name = 'Dal Premium', version = 2 WHERE id = 'i1'"), "OK")
+expect("item version goes backwards", write("UPDATE items SET name = 'Dal', version = 1 WHERE id = 'i1'"),
+       "item_version_not_bumped")
+
+
+def price(store, qty, version, valid_from, amount=4000):
+    return write("INSERT INTO item_prices (item_id, store_id, qty_base, version, price_minor, valid_from, created_at) "
+                 "VALUES ('i2', ?, ?, ?, ?, ?, 0)", store, qty, version, amount, valid_from)
+
+
+expect("default tier set v1 (two tiers)", price(None, 1000, 1, 100) + "/" + price(None, 500, 1, 100, 2500), "OK/OK")
+expect("store override reuses v1", price("s1", 1000, 1, 100, 3900), "price_version_scope")
+expect("store override takes v2", price("s1", 1000, 2, 100, 3900), "OK")
+expect("default v3 while v1 tiers still open (half-open)", price(None, 1000, 3, 200), "price_revision_mixed")
+write("UPDATE item_prices SET valid_to = 200 WHERE item_id = 'i2' AND store_id IS NULL AND valid_to IS NULL")
+expect("default v3 after closing every v1 tier", price(None, 1000, 3, 200, 4200) + "/" +
+       price(None, 500, 3, 200, 2600), "OK/OK")
+expect("older version inserted after a newer one", price("s2", 1000, 2, 300), "price_version_scope")
+
+# Batches (D27) and books (D28): soap received in April at MRP 100 and in May at MRP 200, in store s1
+write("INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, uses_batches, updated_at) "
+      "VALUES ('soap', 'Soap', 'count', 'fixed_only', 'pcs', 'pcs', 1, 0), "
+      "('oil', 'Oil', 'count', 'fixed_only', 'pcs', 'pcs', 1, 0)")
+expect("books: Main (1) and Godown (2) in s1", write(
+    "INSERT INTO books (id, store_id, name, priority, created_at, updated_at) VALUES "
+    "('k_main', 's1', 'Main', 1, 0, 0), ('k_godown', 's1', 'Godown', 2, 0, 0)"), "OK")
+
+
+def batch(bid, no, mrp, received_at, expiry=None, store="s1", book="k_main", item="soap"):
+    return write("INSERT INTO item_batches (id, item_id, store_id, book_id, batch_no, mrp_minor, expiry_date, "
+                 "received_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                 bid, item, store, book, no, mrp, expiry, received_at)
+
+
+def move(mid, bid, direction, qty, reason, bill=None, line_no=None, item="soap", receipt=None):
+    return write("INSERT INTO inventory_movements (id, item_id, bill_id, bill_line_no, direction, qty_base, occurred_at, "
+                 "created_at, batch_id, store_id, reason, receipt_id) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 's1', ?, ?)",
+                 mid, item, bill, line_no, direction, qty, bid, reason, receipt)
+
+
+def on_hand(bid):
+    return con.execute("SELECT on_hand_qty_base FROM batch_stock WHERE batch_id = ?", (bid,)).fetchone()[0]
+
+
+# The register's scan lookup (query-catalogue.md §3, D28). The latest batch sets the MRP and price. Among the
+# batches with that same MRP and price, the line takes one with stock from the lowest-priority book (book 1
+# first); if none has stock, book 1 again (it goes negative). First row = the batch the line uses. Further rows
+# = other batches with stock at a different MRP or price: the cashier is prompted and may switch.
+PICKER = """
+WITH live AS (
+  SELECT b.id, b.mrp_minor, k.priority, b.received_at, IFNULL(s.on_hand_qty_base, 0) AS on_hand, p.price_minor
+  FROM item_batches b
+  JOIN books k ON k.id = b.book_id AND k.active = 1
+  LEFT JOIN batch_stock s ON s.batch_id = b.id
+  LEFT JOIN item_prices p ON p.item_id = b.item_id AND p.batch_id = b.id AND p.qty_base = ?4
+                         AND p.valid_to IS NULL
+  WHERE b.item_id = ?1 AND b.store_id = ?2 AND b.retired_at IS NULL
+    AND (b.expiry_date IS NULL OR b.expiry_date >= ?3)),
+latest AS (SELECT * FROM live ORDER BY received_at DESC, id DESC LIMIT 1),
+same AS (SELECT live.* FROM live, latest
+         WHERE IFNULL(live.mrp_minor, -1) = IFNULL(latest.mrp_minor, -1) AND live.price_minor IS latest.price_minor),
+pick AS (SELECT id FROM same ORDER BY on_hand > 0 DESC, priority, received_at DESC, id DESC LIMIT 1)
+SELECT id, mrp_minor, on_hand, price_minor FROM live
+WHERE id = (SELECT id FROM pick) OR (on_hand > 0 AND id NOT IN (SELECT id FROM same))
+ORDER BY id = (SELECT id FROM pick) DESC, priority, received_at DESC, id DESC
+"""
+
+
+def picker(day="2026-11-14", item="soap", tier=1):
+    return [r[0] for r in con.execute(PICKER, (item, "s1", day, tier))]
+
+
+def prompt(day="2026-11-14", item="soap", tier=1):
+    """The other batches the cashier is told about: (batch, MRP, quantity). Empty = no prompt."""
+    return [tuple(r[:3]) for r in con.execute(PICKER, (item, "s1", day, tier)).fetchall()[1:]]
+
+
+
+
+expect("April batch, no expiry", batch("b_apr", "APR-24", 10000, 100), "OK")
+expect("May batch, no expiry", batch("b_may", "MAY-24", 20000, 200), "OK")
+expect("old batch that expired", batch("b_old", "JAN-24", 9000, 50, expiry="2026-01-01"), "OK")
+expect("receive 10 / 24 / 5", "/".join([move("r1", "b_apr", "in", 10, "receipt"), move("r2", "b_may", "in", 24, "receipt"),
+                                         move("r3", "b_old", "in", 5, "receipt")]), "OK/OK/OK")
+expect("April price in its own store", write(
+    "INSERT INTO item_prices (item_id, store_id, batch_id, qty_base, version, price_minor, mrp_minor, valid_from, "
+    "created_at) VALUES ('soap', 's1', 'b_apr', 1, 1, 10000, 10000, 100, 0)"), "OK")
+expect("May price open at the same time", write(
+    "INSERT INTO item_prices (item_id, store_id, batch_id, qty_base, version, price_minor, mrp_minor, valid_from, "
+    "created_at) VALUES ('soap', 's1', 'b_may', 1, 2, 20000, 20000, 200, 0)"), "OK")
+expect("batch price in another store", write(
+    "INSERT INTO item_prices (item_id, store_id, batch_id, qty_base, version, price_minor, valid_from, created_at) "
+    "VALUES ('soap', 's2', 'b_may', 1, 3, 20000, 200, 0)"), "batch_price_scope")
+expect("latest is May; April has stock at another MRP", picker(), ["b_may", "b_apr"])
+expect("prompt shows April's MRP and quantity", prompt(), [("b_apr", 10000, 10)])
+expect("sell all 10 of April", move("s1m", "b_apr", "out", 10, "sale"), "OK")
+expect("April on hand", on_hand("b_apr"), 0)
+expect("April out of stock: May, no prompt", picker() + prompt(), ["b_may"])
+expect("May sold out too (stock count)", move("a1", "b_may", "out", 24, "adjustment"), "OK")
+expect("the latest batch is used even at zero", picker(), ["b_may"])
+expect("sell past zero offline", move("s2m", "b_may", "out", 2, "sale") + "/" + str(on_hand("b_may")), "OK/-2")
+expect("April restocked: May still first, April in the prompt", move("r4", "b_apr", "in", 6, "receipt") + "/" +
+       ",".join(picker()), "OK/b_may,b_apr")
+expect("void puts the goods back", push("bsoap", [line(1, item="soap")]) + "/" +
+       move("s3m", "b_apr", "out", 1, "sale", bill="bsoap", line_no=1) + "/" + str(on_hand("b_apr")) + "/" +
+       write("INSERT INTO bill_voids (id, bill_id, store_id, terminal_id, user_id, reason, created_at) "
+             "VALUES ('vsoap', 'bsoap', 's1', 't1', 'u1', 'wrong pack', 4000)") + "/" + str(on_hand("b_apr")),
+       "OK/OK/5/OK/6")
+expect("batch edit without a version bump", write("UPDATE item_batches SET expiry_date = '2027-01-01' "
+                                                  "WHERE id = 'b_may'"), "batch_version_not_bumped")
+expect("batch edit with a version bump", write("UPDATE item_batches SET expiry_date = '2027-01-01', version = 2 "
+                                               "WHERE id = 'b_may'"), "OK")
+expect("picker after May expires", picker("2027-02-01"), ["b_apr"])
+expect("delete a batch", write("DELETE FROM item_batches WHERE id = 'b_apr'"), "batch_retire_only")
+expect("archival does not change stock", write("UPDATE schema_meta SET archive_before = '2026-12-01'") + "/" +
+       write("DELETE FROM bill_voids WHERE bill_id = 'bsoap'") + "/" + write("DELETE FROM bills WHERE id = 'bsoap'") +
+       "/" + str(on_hand("b_apr")), "OK/OK/OK/6")
+
+# Books (D28): oil in the Main book (A MRP 150, B MRP 160) and the Godown (C MRP 160, newest)
+expect("A: Main book", batch("o_a", "OIL-A", 15000, 100, item="oil"), "OK")
+expect("B: Main book, newer", batch("o_b", "OIL-B", 16000, 200, item="oil"), "OK")
+expect("C: Godown, newest", batch("o_c", "OIL-C", 16000, 300, item="oil", book="k_godown"), "OK")
+expect("batch in a book of another store", batch("o_y", "OIL-Y", 1, 400, item="oil", store="s2"),
+       "batch_book_store_mismatch")
+expect("purchase entry into the Godown", write(
+    "INSERT INTO stock_receipts (id, store_id, book_id, reference, received_at) "
+    "VALUES ('pr1', 's1', 'k_godown', 'INV-778', 300)"), "OK")
+expect("Godown receipt line into a Main-book batch", move("ro0", "o_a", "in", 5, "receipt", item="oil",
+                                                          receipt="pr1"), "receipt_book_mismatch")
+expect("stock in: A 5, B 3, C 10", "/".join([
+    move("ro1", "o_a", "in", 5, "receipt", item="oil"), move("ro2", "o_b", "in", 3, "receipt", item="oil"),
+    move("ro3", "o_c", "in", 10, "receipt", item="oil", receipt="pr1")]), "OK/OK/OK")
+expect("same MRP in Main (B) and Godown (C): B from book 1; A prompted", picker(item="oil") + prompt(item="oil"),
+       ["o_b", "o_a", ("o_a", 15000, 5)])
+expect("A sold out: B, no prompt", move("so1", "o_a", "out", 5, "sale", item="oil") + "/" +
+       ",".join(picker(item="oil")), "OK/o_b")
+expect("A restocked: prompt again with its quantity", move("ro4", "o_a", "in", 2, "receipt", item="oil") + "/" +
+       str(prompt(item="oil")), "OK/[('o_a', 15000, 2)]")
+expect("B (book 1) sold out: C from book 2", move("so3", "o_b", "out", 3, "sale", item="oil") + "/" +
+       ",".join(picker(item="oil")), "OK/o_c,o_a")
+
+# Same MRP and same price in both books (D28): dal D1 in Main (older), D2 in the Godown (latest)
+write("INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, uses_batches, updated_at) "
+      "VALUES ('dal', 'Dal', 'count', 'fixed_only', 'pcs', 'pcs', 1, 0)")
+
+
+def dal_batch(bid, book, mrp, price, received_at, version, qty):
+    return "/".join([
+        batch(bid, bid.upper(), mrp, received_at, book=book, item="dal"),
+        write("INSERT INTO item_prices (item_id, store_id, batch_id, qty_base, version, price_minor, mrp_minor, "
+              "valid_from, created_at) VALUES ('dal', 's1', ?, 1, ?, ?, ?, ?, 0)", bid, version, price, mrp, received_at),
+        move("in_" + bid, bid, "in", qty, "receipt", item="dal")])
+
+
+expect("D1 Main, D2 Godown: MRP 100, price 95, 4 and 10 in stock",
+       dal_batch("d1", "k_main", 10000, 9500, 400, 1, 4) + "|" + dal_batch("d2", "k_godown", 10000, 9500, 500, 2, 10),
+       "OK/OK/OK|OK/OK/OK")
+expect("same price in both books: book 1 first, no prompt", picker(item="dal") + prompt(item="dal"), ["d1"])
+expect("book 1 sold out: book 2", move("sd1", "d1", "out", 4, "sale", item="dal") + "/" + ",".join(picker(item="dal")),
+       "OK/d2")
+expect("both sold out: back to book 1, which goes negative",
+       move("sd2", "d2", "out", 10, "sale", item="dal") + "/" + ",".join(picker(item="dal")) + "/" +
+       move("sd3", "d1", "out", 1, "sale", item="dal") + "/" + str(on_hand("d1")), "OK/d1/OK/-1")
+expect("a batch at the same MRP but a lower price is prompted",
+       dal_batch("d3", "k_main", 10000, 9000, 450, 3, 3) + "/" + ",".join(picker(item="dal")) + "/" +
+       str(prompt(item="dal")), "OK/OK/OK/d1,d3/[('d3', 10000, 3)]")
+expect("move a batch to another book", write("UPDATE item_batches SET book_id = 'k_godown', version = 2 "
+                                             "WHERE id = 'o_b'"), "batch_version_not_bumped")
+expect("B restocked: Main is book 1, so B is used", move("ro5", "o_b", "in", 1, "receipt", item="oil") + "/" +
+       ",".join(picker(item="oil")), "OK/o_b,o_a")
+expect("swap book priorities in one statement", write(
+    "UPDATE books SET priority = CASE id WHEN 'k_main' THEN 2 ELSE 1 END, version = 2 WHERE store_id = 's1'"),
+    "UNIQUE constraint failed: books.store_id, books.priority")
+expect("swap via a free priority (one db.batch)", "/".join([
+    write("UPDATE books SET priority = 3, version = 2 WHERE id = 'k_main'"),
+    write("UPDATE books SET priority = 1, version = 2 WHERE id = 'k_godown'"),
+    write("UPDATE books SET priority = 2, version = 3 WHERE id = 'k_main'")]), "OK/OK/OK")
+expect("after the swap the Godown is book 1, so C is used instead of B", picker(item="oil"), ["o_c", "o_a"])
+expect("delete a book", write("DELETE FROM books WHERE id = 'k_godown'"), "book_deactivate_only")
+
+# Parent/child (D29): stock lives in the parent's batches in its base unit; children are items with no stock.
+# Books in s1 are now Godown = 1, Main = 2 (swapped above).
+def item(iid, dimension, unit, batched, parent=None, content=None):
+    return write("INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, uses_batches, "
+                 "parent_item_id, content_qty_base, updated_at) VALUES (?, ?, ?, 'fixed_only', ?, ?, ?, ?, ?, 0)",
+                 iid, iid, dimension, unit, unit, batched, parent, content)
+
+
+# The register's lookup for a child line (query-catalogue.md §3): the parent batch with stock from book 1 first,
+# most recent within a book; with no stock anywhere, book 1's most recent (it goes negative).
+def child_pick(parent, day="2026-11-14"):
+    return con.execute("""
+      SELECT b.id FROM item_batches b
+      JOIN books k ON k.id = b.book_id AND k.active = 1
+      LEFT JOIN batch_stock s ON s.batch_id = b.id
+      WHERE b.item_id = ? AND b.store_id = 's1' AND b.retired_at IS NULL
+        AND (b.expiry_date IS NULL OR b.expiry_date >= ?)
+      ORDER BY IFNULL(s.on_hand_qty_base, 0) > 0 DESC, k.priority, b.received_at DESC, b.id DESC
+      LIMIT 1""", (parent, day)).fetchone()[0]
+
+
+expect("coffee sack (parent, grams) and Coffee 1 kg (child, 1000 g per piece)",
+       item("coffee", "mass", "g", 1) + "/" + item("coffee_1kg", "count", "pcs", 0, "coffee", 1000), "OK/OK")
+expect("a batched child", item("coffee_x", "count", "pcs", 1, "coffee", 1000), "item_stock_link_invalid")
+expect("a child without a content", item("coffee_y", "count", "pcs", 0, "coffee"), "item_stock_link_invalid")
+expect("a child of a child (one level)", item("coffee_z", "count", "pcs", 0, "coffee_1kg", 1),
+       "item_stock_link_invalid")
+expect("a child of an unbatched item", item("dal_c", "count", "pcs", 0, "i1", 1), "item_stock_link_invalid")
+expect("sack in Main (20 kg), empty sack in the Godown",
+       batch("cf_main", "CF-M", 200000, 100, item="coffee") + "/" +
+       batch("cf_god", "CF-G", 200000, 50, item="coffee", book="k_godown") + "/" +
+       move("rcf1", "cf_main", "in", 20000, "receipt", item="coffee"), "OK/OK/OK")
+expect("child line draws from the batch with stock", child_pick("coffee"), "cf_main")
+expect("stock in book 1 (Godown) as well: book 1 first",
+       move("rcf2", "cf_god", "in", 5000, "receipt", item="coffee") + "/" + child_pick("coffee"), "OK/cf_god")
+expect("sell 1 x Coffee 1 kg: 1000 g out of the Godown sack",
+       push("bcf1", [line(1, item="coffee_1kg", stock=("coffee", "cf_god", 1000))]) + "/" +
+       move("mcf1", "cf_god", "out", 1000, "sale", bill="bcf1", line_no=1, item="coffee") + "/" +
+       str(on_hand("cf_god")), "OK/OK/4000")
+expect("a child's sale movement on the child item",
+       push("bcf2", [line(1, item="coffee_1kg", stock=("coffee", "cf_god", 1000))]) + "/" +
+       move("mcf2", "cf_god", "out", 1, "sale", bill="bcf2", line_no=1, item="coffee_1kg"),
+       "OK/child_movement_mismatch")
+expect("a child line naming a parent without a quantity",
+       push("bcf3", [line(1, item="coffee_1kg", stock=("coffee", "cf_god", None))]),
+       "CHECK constraint failed: (stock_qty_base IS NULL) = (stock_item_id IS NULL) AND (stock_qty_base IS NULL "
+       "OR stock_qty_base > 0)")
+expect("void the child sale: the 1000 g go back to the sack", write(
+    "INSERT INTO bill_voids (id, bill_id, store_id, terminal_id, user_id, reason, created_at) "
+    "VALUES ('vcf1', 'bcf1', 's1', 't1', 'u1', 'wrong item', 4000)") + "/" + str(on_hand("cf_god")), "OK/5000")
+expect("parent turned unbatched while it has children",
+       write("UPDATE items SET uses_batches = 0, version = 2 WHERE id = 'coffee'"), "item_stock_link_invalid")
+
+# Box -> pack -> piece without a chain: every size is a child of the piece item.
+expect("biscuit (pieces), pack of 10 and box of 20 packs, all children of the piece",
+       item("biscuit", "count", "pcs", 1) + "/" + item("biscuit_pack", "count", "pcs", 0, "biscuit", 10) + "/" +
+       item("biscuit_box", "count", "pcs", 0, "biscuit", 200), "OK/OK/OK")
+expect("3 boxes received = 600 pieces; sell a box, then a pack",
+       batch("bs1", "BS-1", 1000, 100, item="biscuit") + "/" +
+       move("rbs1", "bs1", "in", 3 * 200, "receipt", item="biscuit") + "/" +
+       move("mbs1", "bs1", "out", 200, "sale", item="biscuit") + "/" +
+       move("mbs2", "bs1", "out", 10, "sale", item="biscuit") + "/" + str(on_hand("bs1")), "OK/OK/OK/OK/390")
+
+# Repack (D30): Rice 25 kg sacks (bulk, grams) packed into Rice 1 kg and Rice 500 g (own batches and stock)
+expect("bulk and repack items",
+       item("rice25", "mass", "g", 1) + "/" + item("rice25b", "mass", "g", 1) + "/" +
+       item("rice1kg", "count", "pcs", 1, content=1000) + "/" + item("rice500", "count", "pcs", 1, content=500),
+       "OK/OK/OK/OK")
+
+
+def source(repack_item, bulk):
+    return write("INSERT INTO item_repack_sources (item_id, bulk_item_id, created_at) VALUES (?, ?, 0)",
+                 repack_item, bulk)
+
+
+expect("map Rice 1 kg and Rice 500 g to the sack; Rice 1 kg also to a second rice bulk",
+       source("rice1kg", "rice25") + "/" + source("rice500", "rice25") + "/" + source("rice1kg", "rice25b"),
+       "OK/OK/OK")
+expect("a bulk in another base unit", source("rice1kg", "biscuit"), "repack_source_invalid")
+expect("a repack item as a bulk (chain)", source("rice500", "rice1kg"), "repack_source_invalid")
+expect("a child as a repack item", source("coffee_1kg", "rice25"), "repack_source_invalid")
+expect("a repack item as a parent", item("rice_c", "count", "pcs", 0, "rice1kg", 1), "item_stock_link_invalid")
+expect("sack batch: 25 kg received in Main",
+       batch("r_b1", "RICE-1", 150000, 100, item="rice25") + "/" + batch("r_b2", "RICE-2", 150000, 200, item="rice25")
+       + "/" + move("rr1", "r_b1", "in", 25000, "receipt", item="rice25"), "OK/OK/OK")
+
+
+def repack(rid, kind, bulk_batch, loss=0, book="k_main"):
+    return write("INSERT INTO repacks (id, store_id, book_id, kind, bulk_batch_id, loss_qty_base, packed_at, "
+                 "created_at) VALUES (?, 's1', ?, ?, ?, ?, 500, 500)", rid, book, kind, bulk_batch, loss)
+
+
+def pack_batch(bid, item_id, rid, mrp, book="k_main"):
+    return write("INSERT INTO item_batches (id, item_id, store_id, book_id, batch_no, mrp_minor, received_at, "
+                 "updated_at, repack_id) VALUES (?, ?, 's1', ?, ?, ?, 500, 0, ?)", bid, item_id, book, bid, mrp, rid)
+
+
+def repack_line(rid, no, item_id, bid, qty, content):
+    return write("INSERT INTO repack_lines (repack_id, line_no, item_id, batch_id, qty_base, content_qty_base) "
+                 "VALUES (?, ?, ?, ?, ?, ?)", rid, no, item_id, bid, qty, content)
+
+
+expect("pack 20 x 1 kg and 9 x 500 g, 100 g lost: sack 25000 - 20000 - 4500 - 100", "/".join([
+    repack("rp1", "pack", "r_b1", loss=100),
+    pack_batch("rb_1kg", "rice1kg", "rp1", 6000), pack_batch("rb_500", "rice500", "rp1", 3200),
+    repack_line("rp1", 1, "rice1kg", "rb_1kg", 20, 1000), repack_line("rp1", 2, "rice500", "rb_500", 9, 500),
+    str(on_hand("r_b1")), str(on_hand("rb_1kg")), str(on_hand("rb_500"))]), "OK/OK/OK/OK/OK/400/20/9")
+expect("a pack batch without an MRP", pack_batch("rb_nomrp", "rice1kg", "rp1", None) + "/" +
+       repack_line("rp1", 3, "rice1kg", "rb_nomrp", 1, 1000), "OK/repack_line_invalid")
+expect("a pack line at another content", pack_batch("rb_999", "rice1kg", "rp1", 6000) + "/" +
+       repack_line("rp1", 4, "rice1kg", "rb_999", 1, 999), "OK/repack_line_invalid")
+expect("a second line into the same new batch", repack_line("rp1", 5, "rice1kg", "rb_1kg", 1, 1000),
+       "repack_line_invalid")
+expect("a purchase-entry batch as a pack line", batch("rb_buy", "RB-BUY", 6000, 600, item="rice1kg") + "/" +
+       repack_line("rp1", 6, "rice1kg", "rb_buy", 1, 1000), "OK/repack_line_invalid")
+expect("a pack batch in another book than the repack", pack_batch("rb_g", "rice1kg", "rp1", 6000, book="k_godown"),
+       "repack_batch_scope")
+expect("a repack from an item that is no bulk", repack("rp_x", "pack", "cf_main"), "repack_scope_invalid")
+expect("unpack 5 x 1 kg back into the sack", repack("rp2", "unpack", "r_b1") + "/" +
+       repack_line("rp2", 1, "rice1kg", "rb_1kg", 5, 1000) + "/" + str(on_hand("r_b1")) + "/" + str(on_hand("rb_1kg")),
+       "OK/OK/5400/15")
+expect("unpack into a sack the packs did not come from", repack("rp3", "unpack", "r_b2") + "/" +
+       repack_line("rp3", 1, "rice1kg", "rb_1kg", 1, 1000), "OK/repack_line_invalid")
+expect("repack more than the sack holds: allowed, the sack goes negative", "/".join([
+    repack("rp4", "pack", "r_b1"), pack_batch("rb_1kg2", "rice1kg", "rp4", 6000),
+    repack_line("rp4", 1, "rice1kg", "rb_1kg2", 30, 1000), str(on_hand("r_b1"))]), "OK/OK/OK/-24600")
+expect("edit or delete a saved repack",
+       write("UPDATE repacks SET loss_qty_base = 0 WHERE id = 'rp1'") + "/" +
+       write("DELETE FROM repack_lines WHERE repack_id = 'rp1'"), "repack_immutable/repack_immutable")
+expect("rice ledger nets to the movements", con.execute(
+    "SELECT SUM(CASE direction WHEN 'in' THEN qty_base ELSE -qty_base END) FROM inventory_movements "
+    "WHERE batch_id = 'r_b1'").fetchone()[0], -24600)
+
+expect("schema_version after all migrations", con.execute("SELECT schema_version FROM schema_meta").fetchone(),
+       (len(list((here / "migrations").glob("*.sql"))) + 1,))
+
+print("\nOK" if failures == 0 else f"\n{failures} invariant(s) broken")
+sys.exit(1 if failures else 0)

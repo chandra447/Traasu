@@ -1,29 +1,42 @@
-# D1 schema — one tenant deployment
+# D1 schema: one tenant database
 
-Companion to `docs/d1-schema.sql`. That file is the authority; this one explains why it looks
-the way it does. One tenant means one franchisee, one Worker, one D1 database: no `tenant_id`
-column anywhere, because the database *is* the tenant.
+Companion to `docs/d1-schema.sql` and `docs/migrations/`. Those files are the authority; this one
+explains why they look the way they do.
 
-Tenant isolation is the database boundary, not a predicate and not a column. One franchisee, one
-database, so there is no `tenant_id` to forget in a `WHERE` clause. `tenant_id` appears once, in
-`schema_meta`, as provenance for whoever reads the file; requests are checked against the
-Worker's environment constant instead. That is why a roster query is `user_stores JOIN users`
-with no tenant filter — there is nothing else in the file to filter. Adding a `tenant_id` column
-"for safety" would give the look of row-level isolation while every query still depends on one
-database per franchisee, which is the worst of both models.
+One Worker serves every tenant, routed by Host, and one D1 database per enterprise (T1, D20). The
+database is the tenant boundary: no `tenant_id` column anywhere, because the database *is* the tenant.
+A roster query is `user_stores JOIN users` with no tenant predicate, and that is correct, because
+there is nothing else in the file to filter. Adding a `tenant_id` column "for safety" would give the
+look of row-level isolation while every query still depends on one database per tenant, which is the
+worst of both models.
 
-The same DDL is applied to the terminal's local SQLite. That is why a few columns exist whose
-writer is one side only — `synced_at`, `invoice_no`, `received_at`, and the server-computed
-diagnostics on `bill_lines` — they are described where they appear.
+Tenant identity is resolved before any handler, on every plane (T2):
+
+1. `Host` maps to a tenant from `infra/tenants.json`; an unknown host is `421 unknown_host`.
+2. The tenant's binding supplies the database.
+3. `schema_meta.tenant_id` must equal the routed tenant's id. Cached per isolate per binding, checked
+   once per request; a mismatch is `503 tenant_mismatch`.
+
+Step 3 is the reason `tenant_id` exists at all. The value is not an environment constant, because one
+Worker carries every tenant's secrets and bindings; the row check is what catches a mis-wired binding
+or a restored database before a bill lands in the wrong enterprise's file. `app_id` beside it is the
+audience the device JWT must carry.
+
+The same DDL is applied to the terminal's local SQLite, minus the admin-plane tables (`auth_*`): no
+offline writer exists for those. That is why a few columns exist whose writer is one side only:
+`synced_at`, `invoice_no`, `received_at`, and the server-computed diagnostics on `bill_lines`. They
+are described where they appear.
 
 ## Storage rules
 
 | Kind | Storage | Why |
 |---|---|---|
 | ids | `TEXT`, lowercase UUIDv7, 8-4-4-4-12 hex with dashes | Minted on terminals while offline; UUIDv7 sorts by time, so `TEXT` ordering is creation ordering |
+| auth-plane ids | `TEXT`, Better Auth's 32-character random ids, in `auth_*` only | The library mints them; no offline writer touches these tables |
 | money | `INTEGER` paise | 0.1 + 0.2 is not 0.3; paise are exact and sum exactly |
 | quantities | `INTEGER` base units (g, ml, pcs) | Same reason; conversion happens for display, never for storage |
 | timestamps | `INTEGER` Unix epoch seconds, UTC | No timezone text to parse, no locale, cheap to compare and index |
+| auth-plane timestamps | `TEXT` ISO-8601 UTC, in `auth_*` only | Better Auth writes those strings and a STRICT INTEGER column rejects them. Quarantined in tables nothing else joins |
 | business date | `TEXT` `YYYY-MM-DD` | A date is a label, not an instant; lexicographic order is date order |
 | booleans | `INTEGER` 0/1 with a `CHECK` | SQLite has no boolean type; a `CHECK` keeps stray values out |
 | JSON | `TEXT` with `CHECK (json_valid(...))` | Payloads are written and read whole; nothing filters inside them |
@@ -53,6 +66,7 @@ erDiagram
     terminals ||--o{ numbering_policy : "counts"
     terminals ||--o{ approval_grants : "authorises"
     terminals ||--o{ shifts : "hosts"
+    terminals ||--o{ staff_sessions : "hosts"
     terminals ||--o{ bills : "creates"
 
     units ||--o{ items : "base unit"
@@ -65,7 +79,9 @@ erDiagram
     items ||--o{ inventory_movements : "moves"
 
     users ||--o{ user_stores : "assigned"
-    users ||--o{ sessions : "logs in"
+    users ||--o| staff_credentials : "asserts pin"
+    users ||--o| auth_user : "links by auth_user_id"
+    users ||--o{ staff_sessions : "opens"
     users ||--o{ devices : "enrols"
     users ||--o{ enrol_codes : "mints"
     users ||--o{ approval_grants : "holds"
@@ -75,20 +91,28 @@ erDiagram
     users ||--o{ bill_lines : "overrides"
     users ||--o{ audit_events : "acts"
 
+    auth_user ||--o{ auth_session : "signs in"
+    auth_user ||--o{ auth_account : "holds credentials"
+    auth_user ||--o{ auth_two_factor : "enrols TOTP"
+
     devices ||--o{ bills : "records"
     devices ||--o{ enrol_codes : "consumed by"
     devices ||--o{ audit_events : "acts"
 
     shifts ||--o{ bills : "groups"
+    staff_sessions ||--o{ bills : "attributed by"
     bills ||--o{ bill_lines : "contains"
+    bills ||--o{ bill_voids : "voided by"
     bills ||--o{ inventory_movements : "posts"
     bill_lines ||--o{ inventory_movements : "one per line"
 
     schema_meta {
         int id PK
         int schema_version
+        int sync_epoch
         text tenant_id
         text app_id
+        text archive_before
     }
     catalog_seq {
         int id PK
@@ -148,20 +172,52 @@ erDiagram
         text id PK
         text email
         text role
-        text password_hash
-        text pin_hash
+        text auth_user_id FK
         int active
     }
     user_stores {
         text user_id PK
         text store_id "also PK"
     }
-    sessions {
+    staff_credentials {
+        text user_id PK
+        text pin_hash
+        text pin_salt
+        int updated_at
+    }
+    auth_user {
+        text id PK
+        text email
+        int email_verified
+        int two_factor_enabled
+        text created_at
+    }
+    auth_session {
         text id PK
         text user_id FK
-        text token_hash
-        int expires_at
-        int revoked_at
+        text token
+        text expires_at
+        text created_at
+    }
+    auth_account {
+        text id PK
+        text user_id FK
+        text provider_id
+        text password
+    }
+    auth_two_factor {
+        text id PK
+        text user_id FK
+        text secret
+        int verified
+    }
+    staff_sessions {
+        text id PK
+        text user_id FK
+        text terminal_id FK
+        int started_at
+        int ended_at
+        int assertion_verified_at
     }
     devices {
         text id PK
@@ -171,6 +227,8 @@ erDiagram
         text credential_hash
         text install_id
         int lease_expires_at
+        int approved_at
+        int last_catalog_seq
     }
     enrol_codes {
         text code_hash PK
@@ -224,10 +282,13 @@ erDiagram
         text store_id FK
         text terminal_id FK
         text user_id FK
+        text staff_session_id FK
         text business_date
+        int business_day_start_minutes
         int local_seq
         int total_minor
         int voided
+        int unverified_staff
     }
     bill_lines {
         text bill_id PK
@@ -237,11 +298,36 @@ erDiagram
         int price_version
         text price_source
         int line_total_minor
+        text approval_grant_id
+    }
+    bill_voids {
+        text id PK
+        text bill_id FK
+        text store_id FK
+        text user_id FK
+        text reason
+        int created_at
+    }
+    sales_daily {
+        text store_id PK
+        text business_date "also PK"
+        text item_id "also PK"
+        int qty_base
+        int amount_minor
+        int bill_count
+    }
+    catalog_rebuild {
+        int generation PK
+        int start_seq
+        int end_seq
+        int complete
+        int started_at
     }
     inventory_movements {
         text id PK
         text item_id FK
         text bill_id FK
+        int bill_line_no "also FK"
         int direction
         int qty_base
     }
@@ -255,44 +341,89 @@ erDiagram
     }
 ```
 
-Two things the diagram cannot show: `catalog_changes` has no foreign key (it names its target
-with `entity` + `entity_id`, because it spans ten tables), and `schema_meta` is deliberately
-unconnected — a single provisioning row.
+Four things the diagram cannot show. `catalog_changes` has no foreign key: it names its target with
+`entity` + `entity_id`, because it spans every catalog table. `schema_meta` is deliberately unconnected, a
+single provisioning row. `sales_daily` and `catalog_rebuild` carry no foreign keys either, so a rollup
+rebuild or a journal re-seed cannot be blocked by, or cascade into, the billing tables. `auth_user`,
+`auth_session`, `auth_account` and `auth_two_factor` use Better Auth's ids and ISO TEXT dates, and nothing
+but `users.auth_user_id` crosses from them into the domain tables.
 
 ## Table by table
 
 | Table | Purpose | Key columns | Invariant |
 |---|---|---|---|
-| `schema_meta` | One row recording the migration level and deployment identity | `schema_version`, `tenant_id`, `app_id` | Exactly one row (`CHECK id = 1`). `tenant_id`/`app_id` are provenance; the Worker's env constants are what tokens are checked against |
+| `schema_meta` | One row recording the migration level, restore epoch, tenant identity and the archival floor | `schema_version`, `sync_epoch`, `tenant_id`, `app_id`, `archive_before` | Exactly one row (`CHECK id = 1`). `tenant_id`/`app_id` are what the Host-routed request is checked against, per binding. `sync_epoch` is bumped on every Time Travel restore, so terminals can tell "behind" from "rewound". `archive_before` is the newest date that may be deleted; `'0000-01-01'` means nothing is |
 | `catalog_seq` | The only catalog cursor allocator | `last_seq`, `pruned_below` | One row; every committed `catalog_changes.seq` is in `1..last_seq`; `pruned_below <= last_seq` |
 | `catalog_changes` | Append-only journal of catalog documents that changed | `seq`, `entity`, `entity_id`, `op`, `version` | `seq` is allocated from `catalog_seq`, never by `AUTOINCREMENT`; `op = 'delete'` is a tombstone; an `item_price` row always carries its `version` |
 | `units` | Unit metadata and integer conversion factors | `unit`, `unit_group`, `precision`, `factor_to_base` | `factor_to_base > 0`; the base unit of a group has factor 1. The app converts, the DB never sees a float |
 | `tax_rates` | Flat GST rates | `rate_bp` | Basis points, 0–10000; editing a rate never changes a bill, which copies `tax_rate_bp` onto the line |
-| `stores` | Outlets of this franchisee | `id`, `active` | Ids are permanent; retirement is `active = 0`, never a delete (FKs are `RESTRICT`) |
+| `stores` | Outlets of this enterprise | `id`, `active` | Ids are permanent; retirement is `active = 0`, never a delete (FKs are `RESTRICT`) |
 | `store_settings` | Business-day and rounding policy per store | `business_day_start_minutes`, `rounding_mode` | 0–1439 minutes; exactly one row per store. The terminal derives `business_date` from it, not from midnight |
 | `terminals` | Logical registers | `store_id`, `name` | A register outlives its installs: re-enrolment creates a `devices` row, old bills keep this `terminal_id` |
 | `numbering_policy` | Prefix, padding, reset cadence and counter | `scope`, `terminal_id`, `next_value` | One row per (store, scope, register-or-NULL); `scope = 'register'` iff `terminal_id IS NOT NULL`. The server advances only `scope = 'store'` |
 | `terminal_config` | Versioned register profile (scan/search/cart fields, rounding) | `terminal_id`, `version`, `config_json` | JSON must parse; a terminal applies a config only when `version` is greater than the one it holds |
-| `users` | Owner, staff and cashiers in one table | `role`, `password_hash`, `pin_hash`, `pin_salt` | Non-cashiers have a password; `pin_hash` and `pin_salt` are both present or both absent. Deactivate, never delete: bills keep the id |
+| `users` | Domain identity: owner, staff and cashiers in one table | `role`, `active`, `auth_user_id` | `role` is `owner`, `staff` or `cashier`. `auth_user_id` is unique where not null, and null for cashiers: a cashier has no admin credential, which is what keeps them out of the admin web (see `auth-better-auth.md`). Deactivate, never delete: bills keep the id |
 | `user_stores` | Which stores a user may see, and the cashier roster | `(user_id, store_id)` | Composite PK; the scope check behind every admin query and every roster pull |
-| `sessions` | Admin web sessions | `token_hash`, `token_prefix`, `expires_at`, `absolute_expires_at` | Hash is unique; an idle expiry cannot exceed the absolute one; `revoked_at` set means dead even before expiry |
-| `devices` | Physical installs, one per enrolment | `credential_prefix`, `credential_hash`, `install_id`, `lease_expires_at` | Hash is unique; prefix exists only to make the lookup one index seek; `install_id` mismatch means a cloned disk; the lease records how stale this install's authority is (see below) |
+| `staff_credentials` | Cashier PIN, one row per cashier | `pin_hash`, `pin_salt`, `set_by` | The PIN is verified on the terminal for offline attribution and never reaches the admin plane. `pin_hash` and `pin_salt` are both present by construction |
+| `auth_user` | Better Auth's admin identity | `email`, `email_verified`, `two_factor_enabled` | Owned by the library. No domain column is added here; `users.auth_user_id` is the only crossing |
+| `auth_session` | Better Auth's browser sessions | `token`, `expires_at`, `created_at` | Token stored as issued (the accepted regression). 12 h sliding from `updateAge` 1 h, plus a 30-day absolute cap enforced in middleware from `created_at` |
+| `auth_account` | One row per credential or social provider | `provider_id`, `account_id`, `password` | The password hash lives here, not on `users`. Google OAuth lands here as one more row |
+| `auth_verification` | Email verification, password reset, OAuth state | `identifier`, `expires_at` | No foreign key: the identifier is whatever is being verified |
+| `auth_two_factor` | TOTP secrets and backup codes | `user_id`, `secret`, `backup_codes` | Written only by the `twoFactor` plugin. The `admin` plugin is not used |
+| `auth_rate_limit` | Counters for the admin rate limiter | `key`, `count`, `last_request` | Atomic increments, which KV cannot provide |
+| `staff_sessions` | The window one cashier bills in at one register | `user_id`, `terminal_id`, `started_at`, `ended_at`, `assertion_verified_at` | One live session per terminal. A bill outside every session is accepted and flagged `unverified_staff`, never rejected: the old ABORT triggers killed a sale after a 2-second clock step. Push is an upsert that only closes, never reopens |
+| `devices` | Physical installs, one per enrolment | `credential_prefix`, `credential_hash`, `install_id`, `lease_expires_at`, `approved_at`, `last_catalog_seq` | Hash is unique, and so is `credential_prefix` now that it is the only lookup key. `install_id` is unique among live rows, so a re-install must revoke the old row first; a copied disk changes it. An unapproved device gets `403 approval_pending` from `/v1/token`. `last_catalog_seq` is the prune floor this device has applied. Past the lease, billing stops (see below) |
 | `enrol_codes` | One-time enrolment codes | `code_hash`, `store_id`, `terminal_id`, `expires_at`, `used_at` | Hash is the PK (single use is `used_at` + `used_device_id`); the code is bound to a register that already exists, and to a tenant by being minted inside this database |
 | `approval_grants` | Online-minted authority to approve money exceptions | `terminal_id`, `scope`, `max_overrides`, `max_discount_pct`, `expires_at` | Bound to one terminal and one user, always expiring. Never a cached manager PIN |
 | `items` | Item master | `dimension`, `pricing_mode`, `base_unit`, `tax_rate_id`, flags, `active` | Enums are checked; `dimension`, `pricing_mode` and `base_unit` freeze once a bill line references the item (Worker rule). `updated_at` is informational, not a cursor |
 | `item_prices` | SCD2 price history, franchise default and per-store override | `(item_id, store_id, qty_base, version)`, `valid_from`, `valid_to` | At most one open row per tier per scope; `valid_to` is exclusive and later than `valid_from`; `version` is per item, one PUT per scope |
 | `item_identifiers` | Alias, SKU, EAN, PLU → item (+ optional quantity) | `alias`, `kind`, `store_id`, `qty_base` | Alias is already normalised (uppercase, trimmed) and unique per store among active rows; one item may hold many identifiers |
 | `shifts` | Attribution window for a cashier at a register | `opened_by`, `opened_at`, `closed_at` | No cash fields: v1 has no payments. `closed_at` cannot precede `opened_at` |
-| `bills` | The bill header | `(store_id, terminal_id, local_seq)`, `business_date`, `total_minor`, `voided` | Immutable: voiding flips `voided`/`voided_at` and nothing else. The unique `(store, terminal, local_seq)` is the second line of defence behind the id |
-| `bill_lines` | The receipt: what was sold, at what price, with what tax | `price_version`, `price_source`, `list_price_minor`, `price_minor`, `discount_minor`, `line_total_minor`, `tax_rate_bp`, `computed_list_price_minor`, `price_mismatch` | Money, name, dimension and tax are copies; no report joins `item_prices`. `override`/`manual` require `override_by`. One line per (bill, line_no). `discount_minor` records the reduction the cashier applied; `line_total_minor` is what is owed after it and the only money reports sum. The computed baseline exists to contradict a lying terminal, not to price the sale |
+| `bills` | The bill header | `(store_id, terminal_id, local_seq)`, `business_date`, `total_minor`, `voided`, `staff_session_id`, `business_day_start_minutes` | Arrives unvoided (`trg_bills_insert_unvoided`). The header must reconcile against its own lines (`trg_bills_reconcile_lines`), so lines are written first in the same batch. `business_day_start_minutes` is the store's cutover copied at sale time, so the day a bill belongs to is derivable from the row years later. Deletable only below `schema_meta.archive_before` (see the archival section). The unique `(store, terminal, local_seq)` is the second line of defence behind the id |
+| `bill_lines` | The receipt: what was sold, at what price, with what tax | `price_version`, `price_source`, `list_price_minor`, `price_minor`, `discount_minor`, `line_total_minor`, `tax_rate_bp`, `computed_list_price_minor`, `price_mismatch`, `approval_grant_id` | Money, name, dimension and tax are copies; no report joins `item_prices`. `line_total_minor = taxable + cgst + sgst + cess + igst` and `line_total_minor = list_amount_minor - discount_minor`, both by trigger with no bypass. The split is `cgst = floor(tax/2)`, `sgst = tax - cgst`, also a trigger, so Go and TypeScript cannot disagree on an odd paisa. `override`/`manual` require `override_by`; `approval_grant_id` names the grant that authorised the override and is plain TEXT so an expired grant can be purged without touching the line. Frozen after insert |
+| `bill_voids` | Append-only record of a void | `bill_id`, `store_id`, `user_id`, `reason`, `created_at` | One void per bill (`uq_bill_voids_bill`). An AFTER INSERT trigger sets `bills.voided` and decrements `sales_daily` in the same statement. Voiding is one-way: `trg_bills_void_once` aborts any later update. A void for a bill no longer in D1 (archived) is parked `bill_archived`, never dropped |
+| `sales_daily` | Per store, day and item rollup for month reports | `(store_id, business_date, item_id)`, `qty_base`, `amount_minor`, `bill_count` | Written by triggers on `bills` and `bill_voids`, not by the Worker, so a replayed push (which changes nothing) cannot double-count. Rebuildable from `bill_lines`; the archive job re-derives it after every export |
+| `catalog_rebuild` | A chunked journal re-seed or compaction | `generation`, `start_seq`, `end_seq`, `complete` | Invisible until `complete = 1`: the new floor and epoch are published only after the whole re-seed commits, so a snapshot page taken mid-rebuild either finishes or gets `410 snapshot_invalidated` |
 | `inventory_movements` | Append-only stock hook | `item_id`, `bill_id`, `bill_line_no`, `direction`, `qty_base` | Signed by `direction`, quantity always positive; one row per billed line, adjustments carry no bill |
 | `audit_events` | Append-only audit feed for admin mutations and money exceptions | `kind`, `entity`, `entity_id`, JSON before/after | Actor columns go `NULL` rather than taking the event with them; `kind` is an open vocabulary on purpose (see migrations) |
 
-Nothing here duplicates a report. `bills.total_minor`, `bills.rounding_minor` and
-`bill_lines.line_total_minor` are inputs — the money that changed hands — and every rollup sums
-them. No table holds a per-item or per-day total, so there is no aggregate to go stale when a
-bill is voided or a price changes. `inventory_movements` is a ledger, not a balance: on-hand is
-always a projection (Q13), never a stored column.
+One table does hold a rollup: `sales_daily`. A month report over five store-months would otherwise join and
+aggregate every line in the window, on a single-writer database, while terminals are pushing. Triggers maintain
+it, not the Worker, because a duplicate push is `ON CONFLICT(id) DO NOTHING` and therefore fires no AFTER INSERT
+trigger; a replay or two concurrent pushes of one bill cannot double-count it. A void applies the reverse in the
+same statement that writes `bill_voids`. The row is cheap beside what the bill costs: a realistic 4-line bill
+writes about 42 rows including index entries (measured on D1, 125,750 rows for 3,000 bills), and one bill
+contributes at most one rollup row per distinct item.
+
+Everything else is an input, not an output. `bills.total_minor`, `bills.rounding_minor` and
+`bill_lines.line_total_minor` are the money that changed hands, and the day report sums them live.
+`sales_daily` is rebuildable from `bill_lines` in one statement (kept in the comment in `0002`), which is also
+how a restore repairs it. `inventory_movements` is a ledger, not a balance: on-hand is always a projection
+(Q13), never a stored column.
+
+### Archival and the retention floor
+
+The only DELETE this schema permits on billing rows is the archive job (D22). It exports one store-month to R2
+as `archive/<tenant>/<store>/<yyyy-mm>.jsonl.gz` (bills, lines and voids), re-reads the export and checks row
+counts and the sum of `line_total_minor` against D1, then advances `schema_meta.archive_before` and deletes in
+batches of at most 500 bills, outside shop hours.
+
+`trg_bills_delete_archived_only` aborts any delete of a bill whose `business_date >= archive_before`
+(`bill_not_archivable`). The floor moves forward only, so the job cannot wander into the current month.
+`sales_daily` is never deleted: the rollup outlives its source, which is what keeps a multi-year month report
+cheap after the bills are gone. `retention_months` and the `archival_enabled` flag are META (`tenant_flags`),
+not columns here; the owner sets them in admin.
+
+Measured on real D1: archiving 900 bills (cascade to lines and movements) took 15.60 MB down to 12.67 MB, about
+65% of their footprint. The same delete without `idx_inventory_movements_line` took 8,048 ms and read 73,463,700
+rows; with the index, 55 ms and 33,600 rows. A cascade needs an index on the child key exactly like a join does.
+Deleted space is reclaimed on commit: 300 rows of 1 MB went 301 MB to 151 MB after deleting half, and `VACUUM` is
+both refused inside a transaction and unnecessary.
+
+At 4,961 bytes per realistic 4-line bill, 5 stores at 600 bills a day write about 0.45 GB/month and reach 10 GB
+in roughly 1.8 years. Holding the projection at or below 70% of 10 GB gives about 15 months at 4 lines and about
+7 at 10 lines (10.5 KB/bill). Production also needs Workers Paid: the Free plan's daily D1 rows-read and
+rows-written quotas were exhausted by the measurement run itself, and Free caps a database at 500 MB.
 
 ### The three tables with non-obvious structure
 
@@ -326,16 +457,20 @@ ever read `computed_list_price_minor`, a modified terminal would still not chang
 charged — but the report would stop describing it. The baseline's only job is to make tampering
 visible without rejecting a completed sale.
 
-`devices.lease_expires_at` is refreshed with every token exchange. It gives the terminal a local
-answer to "how stale is my authority?", which a 15-minute JWT alone cannot provide once the
-network is gone. The v1 policy is the brief's: a revoked register keeps billing offline and its
-bills stay exportable; the lease records the fact, and `terminal_config` decides whether new
-bills are refused after N days. It is never read in the sale transaction and never becomes a
-network dependency.
+`devices.lease_expires_at` is refreshed with every token exchange. It gives the terminal a local answer to "how
+stale is my authority", which a 5-minute JWT alone cannot provide once the network is gone.
+
+Past the lease the terminal stops creating bills and shows a blocking dialog (D4). A terminal that has learned it
+is revoked stops immediately, without waiting for the lease to run out. Without that pair, a revoked register
+that never reconnects keeps printing receipts forever. Both decisions are local: the lease is stored, not
+fetched, and the sale transaction never reads it, so billing does not depend on the network. Bills already
+written stay exportable and sync when the terminal reconnects, and the server accepts them: a bill from a
+past-lease device is a fact about a sale that happened, not a security event.
 
 ## Hot queries
 
-The day report and the month report are the same query with different bounds.
+The day report reads `bill_lines`; the month report reads `sales_daily`. Beyond those two, every query below is
+answered by one index or one primary-key range.
 
 **Q1 — catalog pull (the checkpoint read).**
 ```sql
@@ -381,7 +516,9 @@ temporary b-tree for the `ORDER BY`. With the store as an equality, the plan is 
 item_prices USING INDEX idx_item_prices_validity (item_id=? AND store_id=? AND valid_from<?)`
 and `LIMIT 1` stops on the first row.
 
-**Q5 — per-item sales, one day or one month.**
+**Q5 — per-item sales. Single day reads lines; multi-day reads `sales_daily`.**
+
+Single day (the register's own report, 92-day cap on any window):
 ```sql
 SELECT bl.item_id,
        SUM(bl.qty_base)           AS qty_base,
@@ -390,17 +527,36 @@ SELECT bl.item_id,
 FROM bills b
 JOIN bill_lines bl ON bl.bill_id = b.id
 WHERE b.store_id = :store_id
-  AND b.business_date BETWEEN :from AND :to
+  AND b.business_date = :day
   AND b.voided = 0
 GROUP BY bl.item_id
 ORDER BY amount_minor DESC;
 ```
-Both sides are covering-index searches: `idx_bills_store_date` yields bill ids without reading
-`bills`, `idx_bill_lines_report` yields quantities and amounts without reading `bill_lines`.
-Confirmed with `EXPLAIN QUERY PLAN` (SQLite 3.51.0): `SEARCH b USING COVERING INDEX
-idx_bills_store_date` then `SEARCH bl USING COVERING INDEX idx_bill_lines_report`.
+Multi-day and month (the same shape against the rollup, one row per store, day and item):
+```sql
+SELECT item_id,
+       SUM(qty_base)     AS qty_base,
+       SUM(amount_minor) AS amount_minor,
+       SUM(bill_count)   AS bill_count
+FROM sales_daily
+WHERE store_id = :store_id AND business_date BETWEEN :from AND :to
+GROUP BY item_id
+ORDER BY amount_minor DESC;
+```
+The single-day query is two covering-index searches: `idx_bills_store_date` yields bill ids without reading
+`bills`, `idx_bill_lines_report` yields quantities and amounts without reading `bill_lines`. Confirmed with
+`EXPLAIN QUERY PLAN` (SQLite 3.51.0): `SEARCH b USING COVERING INDEX idx_bills_store_date` then `SEARCH bl USING
+COVERING INDEX idx_bill_lines_report`.
 
-**Q6 — day summary (totals per business date).**
+The multi-day query reads a range of the `sales_daily` primary key and touches one row per item per day. Running
+the line query over a month instead would read every line of every bill in the window, on the same single writer
+that terminals are pushing to. The rollup is trigger-maintained (see above), so the two answers agree by
+construction, and a void has already been subtracted by the time either runs. After archival only the rollup is
+left, which is why a report older than the retention window still answers.
+
+**Q6 — day summary (totals per business date).** Reads `bills`, not the rollup: `total_minor` includes
+`rounding_minor`, which `sales_daily` does not carry, so summing the rollup would miss the paise the shop
+rounded away.
 ```sql
 SELECT b.business_date, COUNT(*) AS bills, SUM(b.total_minor) AS amount_minor
 FROM bills b
@@ -431,16 +587,17 @@ ORDER BY bill_id DESC
 LIMIT 100;
 ```
 
-**Q10 — device and session lookup by credential prefix.**
+**Q10 — device lookup by credential prefix.**
 ```sql
-SELECT id, credential_hash, install_id, revoked_at
+SELECT id, credential_hash, install_id, approved_at, revoked_at
 FROM devices WHERE credential_prefix = :prefix;
-
-SELECT id, user_id, token_hash, expires_at, revoked_at
-FROM sessions WHERE token_prefix = :prefix;
 ```
-The prefix narrows to one index seek; the full hash is compared afterwards, and the unique index
-on the hash is the integrity backstop against two rows for one credential.
+`credential_prefix` is unique, so this is one index seek; the full hash is still compared afterwards, and the
+unique index on the hash is the integrity backstop against two rows for one credential. `/v1/token` also checks
+`approved_at IS NOT NULL` here and returns `403 approval_pending` before minting anything (D5).
+
+Admin session lookup is not ours any more: Better Auth runs `SELECT ... FROM auth_session WHERE token = :cookie`,
+served by the `UNIQUE` on `token`.
 
 **Q11 — invoice series allocation, in the same batch as the bill inserts.**
 ```sql
@@ -452,14 +609,22 @@ RETURNING next_value - :n AS first_no;
 
 **Q12 — drill-down on one item over a date window.**
 ```sql
-SELECT b.business_date, SUM(bl.qty_base) AS qty_base, SUM(bl.line_total_minor) AS amount_minor
-FROM bill_lines bl
-JOIN bills b ON b.id = bl.bill_id
-WHERE bl.item_id = :item_id
-  AND b.business_date BETWEEN :from AND :to
-  AND b.voided = 0
-GROUP BY b.business_date;
+SELECT business_date, qty_base, amount_minor
+FROM sales_daily
+WHERE item_id = :item_id
+  AND business_date BETWEEN :from AND :to
+ORDER BY business_date;
 ```
+Which bills sold it is a separate, bounded question and the only query that reads lines across days:
+```sql
+SELECT bill_id, qty_base, line_total_minor
+FROM bill_lines
+WHERE item_id = :item_id
+ORDER BY bill_id DESC
+LIMIT 100;
+```
+That one is served by `idx_bill_lines_item(item_id, bill_id)` with no sort, because the index already carries
+`bill_id`, and on a `WITHOUT ROWID` table it is also ordered by `line_no`.
 
 **Q13 — stock projection (the hedge, not v1 enforcement).**
 ```sql
@@ -471,9 +636,9 @@ GROUP BY item_id;
 
 ## Index to query map
 
-Every index in `docs/d1-schema.sql` appears here. "Full scan" costs are order-of-magnitude
-estimates for one franchisee: 3–5 k items, 5–20 k price rows, 2–4 k bills per store per month,
-~6 lines per bill.
+Every index in `docs/d1-schema.sql` and `docs/migrations/` appears here. Scale for one tenant: 3–5 k items,
+5–20 k price rows, 600 bills per store per day, ~6 lines per bill, 4,961 bytes per realistic 4-line bill. A scan
+that looks harmless at these sizes runs on a single writer that terminals are pushing to.
 
 | Index | Serves | Why a full scan hurts |
 |---|---|---|
@@ -485,23 +650,37 @@ estimates for one franchisee: 3–5 k items, 5–20 k price rows, 2–4 k bills 
 | `uq_item_prices_open` | Price write `WHERE item_id = ? AND store_id IS ? AND valid_to IS NULL`; one current row per tier | Two open rows mean two answers to "the price"; the failure would surface as wrong money, not an error |
 | `uq_item_identifiers_alias` | Q2 — the seek itself; `item_id`, `kind` and `qty_base` come from one row read. Also the uniqueness rule | The alias box is pressed once per line; a scan of identifiers per keystroke is the difference between instant and visible latency |
 | `idx_item_identifiers_item` | Item editor: `WHERE item_id = ? AND active = 1`; deactivating an item's aliases | Keeps the editor independent of catalogue size; without it, editing one item scans all aliases |
-| `idx_devices_prefix` | Q10, device lookup | Token exchange happens every 15 minutes per terminal; a scan of devices is small today and unnecessary forever |
+| `uq_devices_prefix` | Q10, device lookup; the prefix is now unique | Token exchange runs every 5 minutes per terminal; a scan of devices is small today and never worth keeping. Unique rather than plain, so the prefix alone identifies the row |
 | `uq_devices_credential_hash` | Exact verify after the prefix lookup; one row per credential | A duplicate credential would authenticate two installs |
-| `idx_sessions_prefix` | Q10, session lookup | Every admin request; sessions accumulate with each login |
-| `uq_sessions_token_hash` | Exact verify; one row per token | Same class of failure as duplicate device credentials |
-| `idx_sessions_user` | "Revoke all sessions" `WHERE user_id = ?`; session listing | The revoke button must find every session; a scan touches other users' rows too |
-| `uq_users_email` | Admin login `WHERE email = ?` (partial: cashiers have no email) | Login is the first unauthenticated admin call; a scan there is a trivial amplification target |
+| `uq_devices_install_live` | Re-install guard, `UNIQUE(install_id) WHERE revoked_at IS NULL` | A live install id appearing twice means the keychain was copied or a revoke was forgotten |
+| `uq_users_auth_user` | `users WHERE auth_user_id = ?` after every admin session resolves | Partial: cashiers have no `auth_user_id`, so the index holds only admin users |
+| `auth_user` UNIQUE (`email`) | Admin login `WHERE email = ?` | The first unauthenticated admin call; a scan there is a trivial amplification target |
+| `auth_session` UNIQUE (`token`) | Better Auth's cookie lookup on every admin request | One row per token; a duplicate would let two sessions share an identity |
+| `idx_auth_session_user` | Revoke-all on password or OAuth change: `WHERE user_id = ?` | The revoke must find every session for one user, and sessions accumulate with each login |
+| `idx_auth_account_user` | "Which providers has this user linked" | Account rows accumulate every time a provider is linked |
+| `idx_auth_verification_identifier` | Verification, reset and OAuth-state reads by identifier | Token-shaped lookups on every signup and reset |
+| `idx_auth_two_factor_user` | TOTP setup and verification for one user | One row per enrolled user, and the lookup is always by user |
+| `uq_users_email` | Roster and admin lookups by email (partial: cashiers have no email) | Login itself goes through `auth_user`, but the admin panel still searches `users` by email |
 | `idx_user_stores_store` | Store roster `WHERE store_id = ?`; scope check | The roster ships with every catalog pull; scanning user_stores per pull is avoidable |
 | `idx_approval_grants_terminal` | Valid grant lookup `WHERE terminal_id = ? AND revoked_at IS NULL` | Grants expire but are rarely deleted; the valid set stays tiny while the table grows |
+| `uq_staff_sessions_live` | One live session per terminal, `WHERE ended_at IS NULL` | Two cashiers billing from one cart is the failure this prevents. A constraint first, an index second |
+| `idx_staff_sessions_user` | Session history per cashier, `WHERE user_id = ? ORDER BY started_at` | Attribution questions are per cashier, and sessions accumulate daily |
+| `idx_staff_sessions_unsynced` | The session outbox scan on the terminal | Same shape as `idx_bills_unsynced`: a partial index over a handful of rows |
 | `uq_numbering_policy_scope` | Q11 `WHERE store_id = ? AND scope = ?`; one counter per scope | The invoice counter is read in the push transaction; a scan would serialise every push behind the same read |
 | `uq_bills_store_terminal_seq` | Duplicate-sequence detection on push; second line of defence behind the id | This is the constraint that catches a terminal counter reset. A scan per bill would make the check too expensive to run |
 | `uq_bills_invoice_no` | Legal number lookup and uniqueness per store | A duplicated invoice number is a tax problem; the index makes it impossible rather than merely unlikely |
-| `idx_bills_store_date` | Q5 and Q6, covering (`id`, `total_minor` in the index) | The month report would otherwise read every bill row for every line joined; the index turns it into one ordered range |
+| `idx_bills_store_date` | Q6 and Q5's single-day read, covering (`id`, `total_minor` in the index); also the archival export | Non-partial since `0008`: `(store_id, business_date, voided, id, total_minor)`. `0001`'s version was `WHERE voided = 0`, which the export could not use, so it scanned the store's whole history to find voided bills. The day report still seeks on `(store_id, business_date, 0)` and reads nothing outside the index |
 | `idx_bills_unsynced` | Q7 (terminal); on D1 the predicate matches no rows | The outbox scan runs before every push. `EXPLAIN QUERY PLAN` says `SCAN bills USING INDEX idx_bills_unsynced`: that is a scan of the partial index's handful of entries, which is the right plan because the query has no equality to seek. Without the index it scans every retained bill |
-| `idx_bill_lines_report` | Q5, covering | This is the difference between a month report and a full scan of the largest table in the database |
-| `idx_bill_lines_item` | Q12 | Item drill-down is an admin click; scanning all lines to find one item's history is seconds, not milliseconds |
+| `uq_bill_voids_bill` | One void per bill, and the bill lookup behind it | A second void would decrement the rollup twice |
+| `idx_bill_voids_unsynced` | Terminal outbox for voids | Voids are rare; scanning bills per poll is not |
+| `idx_bill_lines_report` | Q5's single-day read, covering | This is the difference between a day report and a full scan of the largest table in the database |
+| `idx_bill_lines_item` | Q12's per-bill list (`WHERE item_id = ? ORDER BY bill_id DESC LIMIT 100`) and the item editor | Scanning every line to find one item's history is seconds, not milliseconds. On a `WITHOUT ROWID` table the index already ends in `line_no`, so no sort is needed |
+| `idx_sales_daily_item` | Q12's date range for one item across stores | Answers "how did this item do" from a handful of rollup rows, without touching the billing tables |
 | `idx_bill_lines_override` | Q9 | Overrides are rare and the table is large; the partial index keeps the audit list proportional to the exceptions, not to sales |
 | `idx_inventory_movements_item` | Q13, `GROUP BY item_id` over a time bound | Q13 has no item predicate, so the best available plan is a scan — of this index, which covers `item_id` and `qty_base` and arrives in item order. Without it the scan reads whole rows (ids, bill references) and then sorts |
+| `idx_inventory_movements_line` | The archival cascade: `DELETE FROM bills` reaches `inventory_movements` by `(bill_id, bill_line_no)` | Measured on D1: without it, deleting 900 bills took 8,048 ms and read 73,463,700 rows; with it, 55 ms and 33,600 rows. The FK cascade from `bill_lines` otherwise scans the whole child table once per deleted line |
+| `sales_daily` PK (`store_id`, `business_date`, `item_id`) | Q5's multi-day read: a range on (store, date) | This is what the rollup exists for. The query never touches `bills` or `bill_lines`, so it stays cheap after those rows are archived |
+| `idx_sales_daily_item` | One item across a date range, any store | Answers "how did this item do" without joining the billing tables |
 | `idx_audit_events_kind_at` | Q8, ordered by `at DESC` | The audit feed is the default admin landing page; a scan sorts the whole table to show 100 rows |
 | `idx_audit_events_entity` | Entity trail: `WHERE entity = ? AND entity_id = ? ORDER BY at DESC` | "What happened to this bill / item" otherwise searches every event |
 
@@ -510,11 +689,20 @@ Two implicit indexes also carry load, and are listed so the map is complete:
 | Index | Serves |
 |---|---|
 | `bills` primary key (`id`, a unique index in a rowid table) | Push idempotency (`ON CONFLICT(id) DO NOTHING`), the Q5 join, every `WHERE id = ?` |
+| `catalog_rebuild` primary key (`generation`) | The open-rebuild check, read once per snapshot page |
 | every other `TEXT PRIMARY KEY` | Single-row lookup by identity; no query filters these tables on anything else at scale |
 
-Policy: FK columns are *not* indexed by default. Rows are never hard-deleted (retirement is
-`active = 0`), so the parent-side FK check is never on a hot path, and each unnecessary index is
-a tax on every insert into `bills` and `bill_lines`.
+Policy: an FK column gets an index only when something reaches the child through it. Joins and cascade deletes
+do; `ON DELETE RESTRICT` parent checks do not, because those look the parent up by its own primary key. That is
+why `bills` and `bill_lines` carry no FK indexes, and why `idx_inventory_movements_line` exists: the archival
+cascade reaches `inventory_movements` through `(bill_id, bill_line_no)` and was measured at 8,048 ms without it,
+55 ms with it. Every unnecessary index is a tax on every insert, and a realistic bill already writes about 42
+rows with its index entries.
+
+D25 makes the delete rule explicit: `devices` and `shifts` are deactivated, never deleted, because their FKs
+from `bills` are `ON DELETE SET NULL` and a delete would silently erase attribution on immutable money rows.
+`trg_devices_no_delete` and `trg_shifts_no_delete` abort instead. `bills` rows are deleted only by the archive
+job, below the retention floor.
 
 ## Checkpoint design
 
@@ -582,21 +770,19 @@ trivial to read, but it is not unbounded, so "offline forever" is not a supporte
 also the reason the cursor is a counter and not a timestamp: a terminal with a wrong clock still
 has a valid cursor, and clock skew cannot silently skip a price change.
 
-### Restores need a `sync_epoch`, and this DDL does not have one yet
+### Restores need the `sync_epoch`
 
-D1 Time Travel can restore a database to an earlier point. That replays the server backwards
-while every terminal's cursor keeps pointing forwards: `catalog_seq.last_seq` can end up lower
-than a cursor a terminal already stored, and documents the terminal has applied can cease to
-exist in the restored database. `seq` alone cannot tell "there is nothing new for you" apart
-from "your history was undone", so a restore must invalidate every cursor explicitly.
+D1 Time Travel can restore a database to an earlier point. That replays the server backwards while every
+terminal's cursor keeps pointing forwards: `catalog_seq.last_seq` can end up lower than a cursor a terminal
+already stored, and documents the terminal has applied can cease to exist in the restored database. `seq` alone
+cannot tell "there is nothing new for you" apart from "your history was undone", so a restore must invalidate
+every cursor explicitly.
 
-The missing piece is a `sync_epoch` — a value minted at provisioning and regenerated on every
-restore, stored beside `catalog_seq` and returned with every pull. A terminal whose stored epoch
-differs from the server's drops its catalog and snapshots, exactly as for `410 stale_cursor`.
-**It is a required addition before Time Travel is used on a production tenant.** It is not in
-`docs/d1-schema.sql` because it belongs with the restore runbook rather than the billing model,
-and adding it later is an additive `ALTER TABLE` — but the pull contract should carry the field
-now so terminals store it from their first sync.
+`schema_meta.sync_epoch` is that value (`0002`). Bump it on every restore, return it with every pull, and a
+terminal whose stored epoch differs drops its catalog and snapshots, exactly as for `410 stale_cursor`. The
+restore is not finished until three things have happened: the epoch is bumped, `sales_daily` is rebuilt from
+`bill_lines` for the days the restore touched, and every terminal re-pushes bills, voids and sessions with
+`created_at >= restore_point - 1 h`. Ids and `payload_sha256` make that re-push idempotent.
 
 ### Cost of the choice
 
@@ -606,15 +792,22 @@ cursor that no clock can corrupt.
 
 ## Migration order and online safety
 
-Statement order in the file is the dependency order, so no deferred foreign key is needed:
-reference data (`units`, `tax_rates`, `stores`, `store_settings`, `terminals`,
-`numbering_policy`, `terminal_config`) → identity (`users`, `user_stores`, `sessions`, `devices`,
-`enrol_codes`, `approval_grants`) → catalog (`items`, `item_prices`, `item_identifiers`,
-`catalog_changes`) → billing (`shifts`, `bills`, `bill_lines`, `inventory_movements`) → audit →
-indexes → seeds → `schema_meta`.
+Statement order in `0001` is the dependency order, so no deferred foreign key is needed: reference data
+(`units`, `tax_rates`, `stores`, `store_settings`, `terminals`, `numbering_policy`, `terminal_config`) →
+identity (`users`, `user_stores`, `staff_credentials`, `auth_*`, `devices`, `enrol_codes`,
+`approval_grants`) → catalog (`items`, `item_prices`, `item_identifiers`, `catalog_changes`) → billing
+(`shifts`, `staff_sessions`, `bills`, `bill_lines`, `bill_voids`, `inventory_movements`) → audit → indexes →
+seeds → `schema_meta`. Migrations `0002` to `0008` follow the same rule in their own order, additive except
+where `0008` replaces a trigger by dropping and recreating it.
 
-`schema_meta.schema_version` is bumped in the same migration that changes the shape, never
-before it. Migration `0001` is applied to an empty database; after that, never edit it.
+Every migration ends by setting `schema_meta.schema_version` to its own number, in the same transaction as its
+DDL: `0002` to 2 through `0008` to 8. A database's level is one row read, and it must agree with D1's own
+`d1_migrations` table; a disagreement means a half-applied migration. The Worker declares the minimum it can
+run against, so the release order is migrate every tenant, then deploy.
+
+`0001` is applied to an empty database and never edited afterwards. It no longer seeds a store, a terminal or a
+numbering policy: provisioning inserts those with fresh UUIDv7 ids, because a fixed id would repeat in every
+tenant's database and make two tenants' bills look like the same bill to anything that compares exports.
 
 | Statement | Safe online? | Note |
 |---|---|---|
@@ -651,8 +844,9 @@ constraints fail the transaction.
   implementation detail rather than a property the design can use, and it gives the pull no
   single row to read as an upper bound. An explicit allocator is one row update per batch and
   makes the guarantee something the schema states.
-- **Timestamps as ISO text.** Sorts, but costs bytes per row, invites timezone formats, and
-  cannot be summed or compared as cheaply as an integer.
+- **Timestamps as ISO text, for domain tables.** Sorts, but costs bytes per row, invites timezone formats, and
+  cannot be summed or compared as cheaply as an integer. The `auth_*` tables are the one exception, because
+  Better Auth writes and reads those strings; they are isolated so the rule holds everywhere else.
 - **`REAL`/`NUMERIC` money, or floats for quantity.** The classic source of one-paise drift and
   of "40.5 pieces". `STRICT` makes the mistake a hard error.
 - **A `''` sentinel instead of `NULL` for the default price scope.** A sentinel cannot carry a
@@ -660,31 +854,61 @@ constraints fail the transaction.
   keeps `NULL` both honest and unique.
 - **Separate `item_aliases` and `barcodes` tables.** One resolution path matters more than tidy
   table names: `kind` distinguishes them and the lookup query stays single.
-- **Deleting or editing bills.** Corrections are void flags; money, lines and tax never change.
-  Reports filter `voided = 0`, so the original stays auditable.
-- **A `daily_sales` / `item_totals` rollup table.** Every number in it would be recomputed from
-  `bill_lines`, and the recomputation is the report. The covering indexes make the live query
-  fast enough at this scale.
-- **Triggers to enforce bill immutability.** The server legitimately updates `invoice_no` and
-  `voided` after insert, so a trigger would need a column exception list that drifts from the
-  policy; D1 also has no way to suspend a trigger for a backfill. The Worker enforces it and the
-  schema makes the money columns copies rather than references.
+- **Deleting or editing bills inside the retention window.** Corrections are void records, never edits; money,
+  lines and tax never change. Reports exclude voided bills, so the original stays auditable. The only delete is
+  the archive job below `archive_before`, and it exports before it deletes.
 - **`deleted_at` soft deletes on bills.** A deleted bill is either voided (kept, excluded from
-  reports) or purged (gone). A third state only creates queries that forget to filter it.
-- **`tenant_id` on every row.** One database per franchisee; a shared database with a tenant
+  reports) or archived (exported to R2, then gone). A third state only creates queries that
+  forget to filter it.
+- **`tenant_id` on every row.** One database per enterprise; a shared database with a tenant
   column was already rejected at the tenancy level, because one missing predicate is a
-  cross-franchise leak.
+  cross-tenant leak.
 - **Integer surrogate primary keys.** Bills and items are created on terminals while offline;
   autoincrement integers collide across terminals and need a server round trip to resolve, which
   is exactly what the offline design forbids.
 
+### Two earlier rejections overturned
+
+Earlier drafts of this file argued against a rollup table and against triggers on bills, on the grounds that any
+denormalised total would go stale and any trigger would need a column exception list. The D1 measurements and
+the replay behaviour changed the answer for both.
+
+**The rollup stays, and triggers maintain it.** The month report is asked for repeatedly, over store-months, while
+terminals push into the same single writer. `sales_daily` answers it from one row per item per day. The staleness
+objection is real but solved by where the write happens: a replayed bill is `ON CONFLICT(id) DO NOTHING`, which
+fires no AFTER INSERT trigger, and a void decrements the rollup in the same statement that records it. The Worker
+could still get this wrong on a retry or a concurrent push; a trigger cannot fire for a row it did not insert.
+`bill_lines` remains the source of truth and the one statement in `0002` rebuilds any window of the rollup.
+
+**Immutability is enforced by triggers, including the delete guard.** The exception list objection was real for
+updates, and the update surface is now closed to exactly one operation: voiding, and only once
+(`trg_bills_void_once`), from a `bill_voids` row. Everything else on a stored bill, line or price is frozen
+(`trg_lines_frozen`, `trg_item_prices_frozen`). Deletes get the same treatment: `trg_bills_delete_archived_only`
+aborts any bill at or above `archive_before`, and `trg_devices_no_delete` / `trg_shifts_no_delete` keep the
+parents of a bill alive. The backfill worry has a concrete answer, because a backfill that needs a trigger
+suspended is a backfill that has to run as a sequence of legal operations anyway; the archive job is the only
+piece of code that deletes, and it deletes only what the floor allows.
+
 ## Verification
 
-The DDL was executed against SQLite 3.51.0 (`sqlite3 -bail`), including a re-run to prove the
-seeds are idempotent, with `PRAGMA foreign_keys = ON`. Each hot query's plan was checked with
-`EXPLAIN QUERY PLAN`: both report tables resolve to covering-index searches, the alias lookup to
-a unique-index seek, the catalog pull to a range scan on the `seq` primary key, and the
-version-at-time lookup to an ordered seek on `idx_item_prices_validity` — the OR-scoped variant
-of that query is what sorts, which is why Q4 is two calls. `STRICT` rejects a fractional price,
-the partial unique indexes reject a second open price and a duplicate alias, and the
-`voided`/`voided_at` pair is enforced by `CHECK`.
+The DDL was executed against SQLite 3.51.0 (`sqlite3 -bail`), including a re-run to prove the seeds are
+idempotent, with `PRAGMA foreign_keys = ON`. `docs/check-schema.py` runs that check on every change.
+`docs/explain-queries.py` checks the plans: the single-day report resolves to covering-index searches on
+`idx_bills_store_date` and `idx_bill_lines_report`, the multi-day report to a range of the `sales_daily` primary
+key, the alias lookup to a unique-index seek, the catalog pull to a range scan on the `seq` primary key, and the
+version-at-time lookup to an ordered seek on `idx_item_prices_validity`. The OR-scoped variant of that last query
+is what sorts, which is why Q4 is two calls.
+
+`STRICT` rejects a fractional price. The partial unique indexes reject a second open price and a duplicate alias.
+`trg_lines_identity_ins` and `trg_lines_discount_identity` reject a line whose money does not reconcile,
+`trg_bills_reconcile_lines` rejects a header that disagrees with its lines, and the delete and void guards reject
+the two operations that would rewrite history.
+
+The capacity numbers in this file come from a real D1 database on 2026-11-14: 4,961 bytes per realistic 4-line
+bill, about 42 rows written per bill including index entries, 8,048 ms and 73,463,700 rows for the unindexed
+cascade delete against 55 ms and 33,600 rows with the index, and immediate space reclaim on commit. The committed
+benchmark is `docs/capacity-bench.py`; on the current schema, which `0008` widened with two `bills` columns and an
+extra index, it prints slightly more than the 4,961 measured before those columns existed. The earlier 1,067 bytes
+per bill in `capacity.md` does not reproduce, and its benchmark script was never committed, so anything quoted
+from it should be replaced by a run of the committed script. The Free plan's daily D1 quotas were exhausted by the
+measurement run itself, which is why production requires Workers Paid (D24).
