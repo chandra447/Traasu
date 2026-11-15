@@ -8,6 +8,7 @@ Thumbs.db
 # generated / local
 node_modules/
 .wrangler/
+.mise/
 *.db
 *.db-wal
 *.db-shm

@@ -1,0 +1,32 @@
+# Toolchain and tasks for the Traasu repo. Install mise, then run `mise install` once.
+# `mise tasks` lists the tasks below; `mise run check` is the gate before any commit.
+
+[tools]
+python = "3.12"                       # docs/check-*.py, capacity-bench.py
+go = "1.25"                           # register (Wails v3 + modernc.org/sqlite)
+node = "24"                           # Worker (Hono), admin web, wrangler, OpenSpec CLI
+uv = "0.8"                            # one-off Python tools (reference/gofrugal/fetch.py)
+"npm:@fission-ai/openspec" = "2.0.0"  # spec CLI: `openspec validate`, `openspec list --specs`
+
+[tasks.check]
+description = "Schema, invariants and query plans; must pass after any DDL change"
+dir = "docs"
+run = ["python check-schema.py", "python check-invariants.py", "python explain-queries.py"]
+
+[tasks."check:capacity"]
+description = "Bytes per bill on the real schema (~4 min)"
+dir = "docs"
+run = "python capacity-bench.py"
+
+[tasks."spec:validate"]
+description = "Validate every OpenSpec spec and change"
+run = "openspec validate --all --strict --no-interactive"
+
+[tasks."spec:list"]
+description = "List capabilities and in-flight changes"
+run = ["openspec list --specs", "openspec list"]
+
+[tasks."gofrugal:fetch"]
+description = "Fetch the GoFrugal pages in reference/gofrugal/pages.txt (local only, git-ignored)"
+dir = "reference/gofrugal"
+run = "uv run --with requests --with beautifulsoup4 --with markdownify --with pypdf python fetch.py --expand-children"
