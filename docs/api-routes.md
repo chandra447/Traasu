@@ -124,7 +124,7 @@ the admin web.
 | GET | `/v1/admin/books` | session | the store's books (stock locations) with priority; priority 1 is the main book (D28) | read | `{store_id, books[]}` | `403 store_forbidden` |
 | POST | `/v1/admin/books` | owner + CSRF | create a book (`store_id`, `name`, `priority`) | **yes** on client `id` | `{book, catalog:{epoch,head}}` | `409 book_name_exists`, `409 priority_taken`, `422 validation_failed` |
 | PATCH | `/v1/admin/books/:id` | owner + CSRF | rename, deactivate/reactivate, or reorder (`priority`); a reorder swaps through a free priority in one `db.batch()` | absolute values; `If-Match` on version | `{books[], catalog:{epoch,head}}` | `404 not_found`, `409 edit_conflict`, `422 validation_failed` |
-| POST | `/v1/admin/stock-receipts` | owner + CSRF | purchase entry into one book: `{store_id, book_id, reference, lines:[{item_id, batch_id} or {item_id, new_batch:{batch_no, mrp_minor, expiry_date?, prices[], is_primary?}}, qty_base]}`; writes the receipt, new batches, prices and one `receipt` movement per line in one `db.batch()` | **yes** on client `id` | `{receipt, book:{id,name}, lines:[{batch, on_hand_qty_base}], catalog:{epoch,head}}` | `404 not_found`, `409 batch_no_exists`, `409 receipt_book_mismatch`, `422 validation_failed` |
+| POST | `/v1/admin/stock-receipts` | owner + CSRF | purchase entry into one book: `{store_id, book_id, reference, lines:[{item_id, qty_base, batch:{batch_no?, mrp_minor, expiry_date?, prices[], is_primary?}}]}`. **Every line creates a new batch** (D28); a blank `batch_no` is generated from the entry. Writes the receipt, the batches, their prices and one `receipt` movement per line in one `db.batch()` | **yes** on client `id` | `{receipt, book:{id,name}, lines:[{batch, on_hand_qty_base}], catalog:{epoch,head}}` | `404 not_found`, `409 batch_no_exists`, `422 validation_failed` |
 | PATCH | `/v1/admin/batches/:id` | owner + CSRF | edit `batch_no`, `mrp_minor`, `expiry_date`, `is_primary` (clears the book's previous primary in the same `db.batch()`), or retire/unretire; bumps the batch `version`. `book_id` cannot change. | absolute values; `If-Match` on version | `{batch, catalog:{epoch,head}}` | `404 not_found`, `409 edit_conflict`, `422 validation_failed` |
 | POST | `/v1/admin/batches/:id/adjustments` | owner + CSRF | change quantity by a signed `qty_delta_base`, or set a counted `qty_base` (the Worker writes the difference); `reason` and `note` required | **yes** on client `id` | `{batch_id, movement, on_hand_qty_base}` | `404 not_found`, `422 validation_failed` |
 | GET | `/v1/admin/reports/sales-by-item` | session | per-item qty/amount for a date range | read | `{range, rows[], totals, provisional_until, next_cursor, has_more}` | `400 invalid_range`, `403 store_forbidden`, `413 range_too_large`, `429 rate_limited` |
@@ -245,10 +245,12 @@ in April at MRP ₹100 and in May at MRP ₹200 are two `item_batch` documents, 
 (`item_price` rows carrying `batch_id`), MRP, optional `expiry_date`, `is_primary`, and the `book_id` of the
 stock location it lives in. `book` documents carry name and priority. At scan the register lists the store's
 batches that are neither retired nor expired, in active books: every batch with stock above zero plus the
-newest batch always. One batch bills directly. Two or more show a picker with book, batch number, MRP,
-selling price and on-hand, with a default preselected: a stocked batch in the lowest-priority book, its
-primary first, then the newest; if nothing has stock, the newest batch. The cashier can change the batch on
-the line before completing the bill. Expired batches show struck out and cannot be picked. On-hand comes
+newest batch always. One batch bills directly. Two or more get a default preselected: a stocked batch in the
+lowest-priority book, its primary first, then the newest; if nothing has stock, the newest batch. If the
+listed batches differ in MRP or in selling price for the scanned quantity, the register prompts the cashier
+with each MRP, book and batch number before adding the line; if they all match, it bills the default
+silently. The cashier can change the batch on the line before completing the bill. Expired batches show
+struck out and cannot be picked. On-hand comes
 from `GET /v1/stock` minus this register's unsynced sales; it is an estimate and never blocks a sale, and a
 quantity above a batch's on-hand shows a warning.
 

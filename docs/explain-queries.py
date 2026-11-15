@@ -74,7 +74,8 @@ QUERIES = {
         "OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1)), "
         "pick AS (SELECT id FROM shown ORDER BY on_hand > 0 DESC, priority, is_primary DESC, "
         "received_at DESC, id DESC LIMIT 1) "
-        "SELECT shown.*, id = (SELECT id FROM pick) AS is_default FROM shown "
+        "SELECT shown.*, id = (SELECT id FROM pick) AS is_default, "
+        "(SELECT COUNT(DISTINCT IFNULL(mrp_minor, -1)) FROM shown) AS mrp_count FROM shown "
         "ORDER BY is_default DESC, priority, is_primary DESC, received_at DESC, id DESC"),
     "batch prices (register, after pick)": (
         "SELECT qty_base, price_minor, mrp_minor, version FROM item_prices "

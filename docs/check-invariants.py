@@ -203,10 +203,11 @@ def on_hand(bid):
     return con.execute("SELECT on_hand_qty_base FROM batch_stock WHERE batch_id = ?", (bid,)).fetchone()[0]
 
 
-# The register's batch list (query-catalogue.md §3). First row is the preselected default.
+# The register's batch list (query-catalogue.md §3). First row is the preselected default; mrp_count > 1
+# means the listed batches carry different MRPs, so the register prompts the cashier (D28).
 PICKER = """
 WITH live AS (
-  SELECT b.id, k.priority, b.is_primary, b.received_at, IFNULL(s.on_hand_qty_base, 0) AS on_hand
+  SELECT b.id, b.mrp_minor, k.priority, b.is_primary, b.received_at, IFNULL(s.on_hand_qty_base, 0) AS on_hand
   FROM item_batches b
   JOIN books k ON k.id = b.book_id AND k.active = 1
   LEFT JOIN batch_stock s ON s.batch_id = b.id
@@ -217,13 +218,18 @@ shown AS (
   WHERE on_hand > 0 OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1)),
 pick AS (
   SELECT id FROM shown ORDER BY on_hand > 0 DESC, priority, is_primary DESC, received_at DESC, id DESC LIMIT 1)
-SELECT id FROM shown
+SELECT id, (SELECT COUNT(DISTINCT IFNULL(mrp_minor, -1)) FROM shown) AS mrp_count FROM shown
 ORDER BY id = (SELECT id FROM pick) DESC, priority, is_primary DESC, received_at DESC, id DESC
 """
 
 
 def picker(day="2026-11-14", item="soap"):
     return [r[0] for r in con.execute(PICKER, (item, "s1", day))]
+
+
+def prompts(day="2026-11-14", item="soap"):
+    rows = con.execute(PICKER, (item, "s1", day)).fetchall()
+    return "prompt" if rows and rows[0][1] > 1 else "silent"
 
 
 
@@ -283,10 +289,13 @@ expect("stock in: A 5, B 3, C 10", "/".join([
     move("ro1", "o_a", "in", 5, "receipt", item="oil"), move("ro2", "o_b", "in", 3, "receipt", item="oil"),
     move("ro3", "o_c", "in", 10, "receipt", item="oil", receipt="pr1")]), "OK/OK/OK")
 expect("default is the Main book's primary", picker(item="oil"), ["o_a", "o_b", "o_c"])
+expect("MRP 150 and MRP 160 listed: cashier is prompted", prompts(item="oil"), "prompt")
 expect("primary sold out: next stocked batch in Main", move("so1", "o_a", "out", 5, "sale", item="oil") + "/" +
        ",".join(picker(item="oil")), "OK/o_b,o_c")
+expect("two batches, same MRP 160: no prompt", prompts(item="oil"), "silent")
 expect("Main book empty: fall back to the Godown", move("so2", "o_b", "out", 3, "sale", item="oil") + "/" +
        ",".join(picker(item="oil")), "OK/o_c")
+expect("one batch: no prompt", prompts(item="oil"), "silent")
 expect("Main restocked: Main's primary is the default again", move("ro4", "o_a", "in", 2, "receipt", item="oil") +
        "/" + ",".join(picker(item="oil")), "OK/o_a,o_c")
 expect("move a batch to another book", write("UPDATE item_batches SET book_id = 'k_godown', version = 2 "

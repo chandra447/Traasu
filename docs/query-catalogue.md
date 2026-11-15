@@ -83,15 +83,17 @@ shown AS (                                   -- stocked batches, plus the newest
 pick AS (                                    -- main book first, primary first, then newest
   SELECT id FROM shown
   ORDER BY on_hand > 0 DESC, priority, is_primary DESC, received_at DESC, id DESC LIMIT 1)
-SELECT shown.*, id = (SELECT id FROM pick) AS is_default
+SELECT shown.*, id = (SELECT id FROM pick) AS is_default,
+       (SELECT COUNT(DISTINCT IFNULL(mrp_minor, -1)) FROM shown) AS mrp_count
 FROM shown
 ORDER BY is_default DESC, priority, is_primary DESC, received_at DESC, id DESC;
 ```
 
-More than one row means the cashier sees the list with the default preselected and can change it; the
-chosen batch's prices are `SELECT ... FROM item_prices WHERE item_id = ?1 AND batch_id = ?4 AND valid_to IS
-NULL`. Plans on `idx_item_batches_live`, the `books` and `batch_stock` primary keys, and
-`uq_item_prices_open` (`explain-queries.py`).
+`mrp_count > 1` means the listed batches carry different MRPs, so the register prompts the cashier (D28); it
+also prompts when the batches' selling prices for the scanned quantity differ, which it checks after loading
+them with `SELECT ... FROM item_prices WHERE item_id = ?1 AND batch_id = ?4 AND valid_to IS NULL`. Otherwise
+it bills the default silently. Plans on `idx_item_batches_live`, the `books` and `batch_stock` primary keys,
+and `uq_item_prices_open` (`explain-queries.py`).
 
 Stock pull (`GET /v1/stock?since=`), store-scoped, by the `stock_seq` cursor:
 

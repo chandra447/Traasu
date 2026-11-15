@@ -537,7 +537,9 @@ expired, and shows:
 - the newest batch always, even at zero or below.
 
 One batch listed: it bills directly, no prompt. Two or more: the register preselects a default (D28: main
-book first, its primary batch first), and the cashier can change it on the line before completing the bill.
+book first, its primary batch first). If the listed batches differ in MRP or selling price, the register
+stops and prompts the cashier with each MRP before the line is added; if they are all the same, it bills the
+default silently. The cashier can change the batch on the line before completing the bill.
 So when the April batch sells out, the cashier only sees May. Expired batches show struck out and cannot be
 picked.
 
@@ -592,9 +594,10 @@ still has one.
 ### Purchase entry (admin)
 
 1. The admin picks the store and the book. The screen header shows the book name for the whole entry.
-2. For each line: pick an existing batch in that book (adds stock), or create a new batch with batch number,
-   MRP, optional expiry, selling prices and an optional "primary" tick. Following GoFrugal, different price
-   details mean a new batch; the screen offers the existing batch when MRP and price match.
+2. **Every line is a new batch.** Each line creates its own batch with batch number (generated from the
+   entry if left blank), MRP, optional expiry, selling prices and an optional "primary" tick. Lines never top
+   up an older batch, even at the same MRP and price, so each batch is exactly one stock entry and its stock
+   age stays visible.
 3. Save writes the receipt, the new batches and their prices, and one `receipt` movement per line in one
    `db.batch()`.
 
@@ -611,8 +614,14 @@ is the first match of:
 
 So stock is used from the main book first, and falls back to the next book only when the main book has none
 of that item. If the primary batch is sold out but another batch in the same book has stock, the default is
-that other batch. One batch listed means it is primary by definition and bills with no prompt. The cashier can
-change the batch on any line before completing the bill.
+that other batch. One batch listed means it is primary by definition and bills with no prompt.
+
+**The MRP prompt.** When two or more batches are listed and they do not all share the same MRP and the same
+selling price for the scanned quantity, the register prompts: "2 MRPs: ₹100 (APR-24, Main) / ₹200 (MAY-24,
+Godown)", with the default preselected. The cashier confirms the default or picks the MRP printed on the
+pack. Batches that share MRP and price bill the default silently: they are the same pack to the customer.
+The picker query returns `mrp_count` for the MRP half; the register compares the loaded prices for the
+other half. The cashier can change the batch on any line before completing the bill.
 
 | Main book | Godown | Default |
 |---|---|---|
