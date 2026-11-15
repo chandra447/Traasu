@@ -242,7 +242,8 @@ END;
 -- ---------------------------------------------------------------------------
 -- Books (D28): stock locations inside one store (shop floor, godown, back
 -- room), like GoFrugal's godowns. Every batch lives in one book. priority 1 is
--- the main book: stock is taken from it first, then from the next priority.
+-- the main book; priority orders books in admin screens and in the register's
+-- "other batches" prompt. It does not choose the batch billed (D28: latest).
 -- Provisioning creates a 'Main' book (priority 1) for every store.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS books (
@@ -257,7 +258,7 @@ CREATE TABLE IF NOT EXISTS books (
 ) STRICT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_books_name ON books(store_id, name);
--- One active book per priority, so "main" and the fallback order are never ambiguous.
+-- One active book per priority, so the order of books is never ambiguous.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_books_priority ON books(store_id, priority) WHERE active = 1;
 
 CREATE TRIGGER IF NOT EXISTS trg_books_version
@@ -280,8 +281,8 @@ END;
 -- Batches (D27). Stock of one item arrives in batches: soap received in April
 -- at MRP 100 and in May at MRP 200 are two batches, both on the shelf. A batch
 -- belongs to one store and one book, carries its MRP, an optional expiry, its
--- own selling-price tier set, and a quantity kept as a ledger. is_primary marks
--- the batch the register preselects within its book (D28).
+-- own selling-price tier set, and a quantity kept as a ledger. The register
+-- bills the latest batch and prompts about others (D28).
 -- Modelled on GoFrugal's batch-wise billing; see DECISIONS.md D27, D28.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS item_batches (
@@ -294,7 +295,6 @@ CREATE TABLE IF NOT EXISTS item_batches (
   -- NULL = no expiry (most grocery). A past date makes the batch unsellable.
   expiry_date  TEXT CHECK (expiry_date IS NULL
                           OR expiry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
-  is_primary   INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0, 1)),
   received_at  INTEGER NOT NULL,
   retired_at   INTEGER,
   version      INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
@@ -305,10 +305,6 @@ CREATE TABLE IF NOT EXISTS item_batches (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_item_batches_no ON item_batches(store_id, item_id, batch_no);
 CREATE INDEX IF NOT EXISTS idx_item_batches_live
   ON item_batches(item_id, store_id, received_at) WHERE retired_at IS NULL;
--- At most one primary per item per book among live batches. Setting a new
--- primary clears the old one in the same db.batch().
-CREATE UNIQUE INDEX IF NOT EXISTS uq_item_batches_primary
-  ON item_batches(item_id, book_id) WHERE is_primary = 1 AND retired_at IS NULL;
 
 CREATE TRIGGER IF NOT EXISTS trg_item_batches_book_store
 BEFORE INSERT ON item_batches
@@ -327,8 +323,7 @@ WHEN NEW.version < OLD.version
   OR NEW.item_id IS NOT OLD.item_id OR NEW.store_id IS NOT OLD.store_id OR NEW.book_id IS NOT OLD.book_id
   OR (NEW.version = OLD.version AND (
         NEW.batch_no IS NOT OLD.batch_no OR NEW.mrp_minor IS NOT OLD.mrp_minor
-     OR NEW.expiry_date IS NOT OLD.expiry_date OR NEW.retired_at IS NOT OLD.retired_at
-     OR NEW.is_primary IS NOT OLD.is_primary))
+     OR NEW.expiry_date IS NOT OLD.expiry_date OR NEW.retired_at IS NOT OLD.retired_at))
 BEGIN
   SELECT RAISE(ABORT, 'batch_version_not_bumped');
 END;
