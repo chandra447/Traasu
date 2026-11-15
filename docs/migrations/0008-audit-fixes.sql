@@ -207,4 +207,61 @@ CREATE TABLE IF NOT EXISTS catalog_rebuild (
   started_at  INTEGER NOT NULL
 ) STRICT;
 
+-- ---------------------------------------------------------------------------
+-- Versions a bill line is billed on (D26). The terminal's local catalog is the
+-- source of truth for a sale; the line records which item and price versions
+-- it used, so the server can identify them exactly instead of guessing by clock.
+-- ---------------------------------------------------------------------------
+
+-- Item document version: every admin edit bumps it; catalog_changes carries it.
+ALTER TABLE items ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0);
+ALTER TABLE bill_lines ADD COLUMN item_version INTEGER NOT NULL DEFAULT 1 CHECK (item_version > 0);
+
+-- A version never goes backwards, and the same version never means two
+-- documents. Equal version with equal content is allowed: that is a terminal
+-- replaying a catalog page.
+CREATE TRIGGER IF NOT EXISTS trg_items_version
+BEFORE UPDATE ON items
+WHEN NEW.version < OLD.version
+  OR (NEW.version = OLD.version AND (
+        NEW.name IS NOT OLD.name OR NEW.name_local IS NOT OLD.name_local
+     OR NEW.dimension IS NOT OLD.dimension OR NEW.pricing_mode IS NOT OLD.pricing_mode
+     OR NEW.base_unit IS NOT OLD.base_unit OR NEW.default_sales_unit IS NOT OLD.default_sales_unit
+     OR NEW.tax_rate_id IS NOT OLD.tax_rate_id OR NEW.hsn IS NOT OLD.hsn
+     OR NEW.price_includes_tax IS NOT OLD.price_includes_tax OR NEW.mrp_minor IS NOT OLD.mrp_minor
+     OR NEW.allow_discount_pct IS NOT OLD.allow_discount_pct
+     OR NEW.restrict_price_edit IS NOT OLD.restrict_price_edit
+     OR NEW.prompt_qty IS NOT OLD.prompt_qty OR NEW.scale_qty IS NOT OLD.scale_qty
+     OR NEW.active IS NOT OLD.active))
+BEGIN
+  SELECT RAISE(ABORT, 'item_version_not_bumped');
+END;
+
+-- Price version names one revision of one scope (schema review D17): versions
+-- are per item across all scopes and only grow, so (item_id, version) plus
+-- bill_lines.price_store_id identifies the exact tier set a line used.
+CREATE TRIGGER IF NOT EXISTS trg_item_prices_version_scope
+BEFORE INSERT ON item_prices
+WHEN EXISTS (SELECT 1 FROM item_prices p
+             WHERE p.item_id = NEW.item_id
+               AND (p.version > NEW.version
+                    OR (p.version = NEW.version AND IFNULL(p.store_id, '') <> IFNULL(NEW.store_id, ''))))
+BEGIN
+  SELECT RAISE(ABORT, 'price_version_scope');
+END;
+
+-- No half-open revision (schema review D16): the writer closes every open row
+-- of the scope, then inserts the whole new tier set at one version and one
+-- valid_from. A partial write aborts instead of shipping mixed tiers.
+CREATE TRIGGER IF NOT EXISTS trg_item_prices_revision_coherent
+BEFORE INSERT ON item_prices
+WHEN EXISTS (SELECT 1 FROM item_prices p
+             WHERE p.item_id = NEW.item_id
+               AND IFNULL(p.store_id, '') = IFNULL(NEW.store_id, '')
+               AND p.valid_to IS NULL
+               AND (p.version <> NEW.version OR p.valid_from <> NEW.valid_from))
+BEGIN
+  SELECT RAISE(ABORT, 'price_revision_mixed');
+END;
+
 UPDATE schema_meta SET schema_version = 8 WHERE id = 1;

@@ -225,7 +225,7 @@ Changes to this file's earlier rulings:
 - §C "Argon2id for owner passwords": moot; Better Auth hashes with scrypt (D17).
 - §C "Owner TOTP MFA": Better Auth `twoFactor`; table `auth_two_factor` (0007).
 - §C "Two-step enrolment": in the route table now (D5 revision).
-- §F open items closed by D25: D30, D33, D42, D44, D45, D46. D16/D17 price revisions remain open, to be
-  decided before the price editor is built.
+- §F open items closed by D25: D30, D33, D42, D44, D45, D46. D16/D17 price revisions are closed by D26
+  (0008 triggers `trg_item_prices_version_scope`, `trg_item_prices_revision_coherent`).
 - §G "No EXPLAIN against a seeded, large database": bytes per bill and archival delete cost are now
   measured on real D1; query plans are still checked on a small seed (`explain-queries.py`).

@@ -451,4 +451,49 @@ From the deferred list in `TRIAGE.md` §F, the ones that change immutable rows o
 | D33 grants | `bill_lines.approval_grant_id`; the Worker counts uses against `max_overrides` |
 | D45 returns | quantities and totals stay positive; returns are a separate document type after v1 |
 | D44, D46 enums | no new CHECK vocabularies on `bills`, `bill_lines`, `catalog_changes`; the Worker validates |
-| D16, D17 price revisions | still open; decide before the price editor is built |
+| D16, D17 price revisions | decided in D26: one version per revision of one scope, no half-open tier sets |
+
+## D26. The register's catalog is the truth for a sale; a line records the versions it used
+
+The register prices every line from its **local SQLite** catalog, online or offline. The server never sends a
+corrected price into a bill and never rewrites one (D2). What the customer paid is the bill.
+
+Each line freezes, at the moment it is added to the cart:
+
+- `item_version` (new, 0008) and the copied item fields: `item_name`, `dimension`, `hsn`, `tax_rate_bp`,
+  `price_includes_tax`;
+- `price_version` and `price_store_id` (`NULL` = franchise default), which together name exactly one tier set;
+- the money: `list_price_minor`, `price_minor`, `price_breakdown`, `list_amount_minor`, taxes.
+
+**Open cart.** A catalog update that lands while a cart is open does not reprice it. Lines already in the cart
+keep their frozen versions and money; lines added after the update use the new catalog. A price never changes
+on screen in front of the customer, and the bill shows exactly what the cashier saw.
+
+**Versions are unambiguous** (closes schema review D16, D17; 0008 triggers):
+
+| Rule | Enforced by |
+|---|---|
+| `items.version` grows on every content change; a replay of the same version is a no-op | `trg_items_version` |
+| A price version belongs to one scope and versions only grow per item, across all scopes | `trg_item_prices_version_scope` |
+| A scope's open tiers share one version and one `valid_from`; a partial write aborts | `trg_item_prices_revision_coherent` |
+
+The Worker allocates the next price version as `MAX(version) + 1` over the item, closes every open row of the
+scope, then inserts the whole new tier set in the same batch. The register applies an item's price set in
+ascending version order, so the same triggers hold on its copy.
+
+**Server check on push.** The Worker finds the line's tier set by key, not by clock:
+`item_id`, `IFNULL(store_id,'') = IFNULL(price_store_id,'')`, `version = price_version`.
+
+| Lookup result | Flag |
+|---|---|
+| Found, and open at `created_at` | none |
+| Found, but closed before `created_at` | `stale_price`: the register had not synced the change yet |
+| Not found | `price_mismatch`: a version the server never issued |
+| Claimed list price differs from that version's rows | `price_mismatch` |
+
+`computed_list_price_minor` still records the price the server would have charged at `created_at`, so the owner
+sees the size of the gap. Flags are for review; the bill is accepted as charged.
+
+Cost: every item edit must bump `version` (the trigger refuses one that does not), and the register must keep
+the version numbers it received. Item history is not stored as rows: the line's copies are the record of what
+an old version said.

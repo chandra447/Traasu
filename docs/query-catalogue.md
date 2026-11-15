@@ -239,21 +239,22 @@ floor gets `410 stale_cursor` and a full snapshot.
 
 ## 15. Stale price check on push
 
-For each pushed line, compare `price_version` with the version valid at `bills.created_at` **using the same
-scope resolution as the price itself** — store row first, franchise default second. Omitting the scope is the
-bug the schema review found: a tiered sale resolves to zero rows and is silently never flagged.
+Each line names its tier set exactly (D26): `price_version` and `price_store_id` (`NULL` = franchise
+default). The check looks that set up by key, then asks whether it was still open when the bill was made.
+No clock comparison decides *which* version the register used; the line says so.
 
 ```sql
-SELECT version FROM item_prices
-WHERE item_id = ?1 AND qty_base = ?2
-  AND (store_id IS ?3 OR store_id IS NULL)
-  AND valid_from <= ?4 AND (valid_to IS NULL OR valid_to > ?4)
-ORDER BY store_id IS NULL, valid_from DESC
-LIMIT 1;
+SELECT qty_base, price_minor, valid_from, valid_to FROM item_prices
+WHERE item_id = ?1
+  AND IFNULL(store_id, '') = IFNULL(?2, '')    -- ?2 = bill_lines.price_store_id
+  AND version = ?3;                            -- ?3 = bill_lines.price_version
 ```
 
-A mismatch sets `stale_price` on the line. Diagnostic only. Same index and same bounded temp b-tree as
-§3; this runs once per line, inside the bill's batch, so it costs no extra D1 call.
+No rows: `price_mismatch` (a version the server never issued). Rows closed (`valid_to <= created_at`):
+`stale_price`, the register had not synced the change. Claimed tier prices that differ from these rows:
+`price_mismatch`. `computed_list_price_minor` still comes from the §3 query at `created_at`. Diagnostic only;
+the money is never rewritten. Seeks `uq_item_prices_key (item_id, IFNULL(store_id,''), qty_base, version)`
+on its first two columns and filters version. It runs inside the bill's batch, so it costs no extra D1 call.
 
 ## 16. Archival delete (monthly job, per store-month)
 

@@ -207,7 +207,7 @@ Delta response (store-scoped; documents are current state, not the state at `seq
  "has_more":true,"server_time":1763107200,
  "changes":[
   {"seq":8415,"entity":"item","entity_id":"0192f3c4-8a5b-7c3d-9e1f-2a3b4c5d6e7f",
-   "op":"upsert","version":null,"document":{"id":"0192f3c4-...","name":"Tamarind",
+   "op":"upsert","version":3,"document":{"id":"0192f3c4-...","version":3,"name":"Tamarind",
    "name_local":"చింతపండు","dimension":"mass","pricing_mode":"fixed_only","base_unit":"g",
    "default_sales_unit":"kg","tax_rate_id":"...0002","hsn":"0810","price_includes_tax":true,
    "mrp_minor":5000,"allow_discount_pct":0,"restrict_price_edit":true,"prompt_qty":false,
@@ -308,8 +308,8 @@ local_seq)` exists with another id → `duplicate_seq`.
  "subtotal_minor":6190,"tax_minor":310,"total_minor":6500,"rounding_minor":0,
  "created_at":1763107200,"payload_sha256":"b0e1...64hex",
  "lines":[{"line_no":1,"item_id":"0192f3c4-8a5b-7c3d-9e1f-2a3b4c5d6e7f",
-  "item_name":"Tamarind","dimension":"mass","qty_base":1500,"price_version":8,
-  "price_source":"tier","approval_grant_id":null,
+  "item_name":"Tamarind","dimension":"mass","qty_base":1500,"item_version":3,
+  "price_version":8,"price_store_id":null,"price_source":"tier","approval_grant_id":null,
   "price_basis_qty_base":1000,"list_price_minor":4000,"price_minor":4000,
   "list_amount_minor":6500,"discount_minor":0,
   "price_breakdown":{"parts":[{"qty_base":1000,"price_minor":4000},
@@ -365,9 +365,17 @@ Money rules, enforced by the Worker and by the terminal's own triggers (D23):
   `total_minor = Σ line_total_minor + rounding_minor`, and at least one line. Tax is per line and
   inclusive; a per-rate invoice summary is derived from the lines, never computed a second way.
 
-The Worker recomputes the applicable list price from its own `item_prices` at `created_at`, stores the
-claim-vs-computed delta (`computed_list_price_minor`, `price_mismatch`) and sets `stale_price`,
-`policy_violation` and `staff_inactive` from server math. Money is never rewritten and a completed sale
+The register's local catalog is the source of truth for the sale (D26). Each line freezes `item_version`,
+`price_version` and `price_store_id` (`null` = franchise default) when it is added to the cart, with the
+copied item fields and money. A catalog update that arrives while a cart is open never reprices lines
+already in it; only lines added afterwards use the new catalog. `item` change rows and documents carry
+`version`, and the register applies an item only when that version is not older than the one it holds.
+
+The Worker finds each line's tier set by key (`item_id`, scope from `price_store_id`, `price_version`),
+not by clock. Open at `created_at`: no flag. Closed before `created_at`: `stale_price` (the register had
+not synced yet). Unknown version, or a claimed list price that differs from that version's rows:
+`price_mismatch`. `computed_list_price_minor` records what the server's catalog charged at `created_at`.
+It also sets `policy_violation` and `staff_inactive` from server math. Money is never rewritten and a completed sale
 is never rejected for policy. `invoice_no` is server-assigned per store from `numbering_policy`; the
 terminal treats it as opaque. `store_id`/`terminal_id`/`device_id` come from the JWT.
 `business_day_start_minutes` is copied from `store_settings` at sale time (D42), so a later change to

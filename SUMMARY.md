@@ -84,7 +84,7 @@ Status: design only. No code written. Diagram: `.archify/architecture-grocery-po
 - Loose vs packed forms of one product: one item with variants, or separate items.
 - Tailwind v4 browser floor vs old WebView2 / WebKitGTK on shop machines; fall back to v3 if needed.
 - Unsynced bills are lost if the disk dies; consider local backups.
-- Price revisions (when an edit closes a version and opens the next) must be decided before the price editor is built.
+- Price revisions are decided (D26): one version per revision of one scope, no half-open tier sets, and each bill line records `item_version`, `price_version` and `price_store_id`.
 - R2 retention: 6 years assumed for GST records; the owner should confirm with the accountant.
 - Google's limit on redirect URIs per OAuth client decides whether one client can serve every tenant.
 

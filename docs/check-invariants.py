@@ -153,6 +153,31 @@ expect("archive: voids first, then bills", write("DELETE FROM bill_voids WHERE b
 expect("archive leaves no lines behind", con.execute("SELECT COUNT(*) FROM bill_lines").fetchone(), (0,))
 expect("archive keeps sales_daily", con.execute("SELECT COUNT(*) FROM sales_daily").fetchone(), rollup_rows)
 
+# Item and price versions (D26)
+expect("item edit without a version bump", write("UPDATE items SET name = 'Dal Premium' WHERE id = 'i1'"),
+       "item_version_not_bumped")
+expect("item edit with a version bump", write("UPDATE items SET name = 'Dal Premium', version = 2 WHERE id = 'i1'"),
+       "OK")
+expect("terminal replays the same item version", write(
+    "UPDATE items SET name = 'Dal Premium', version = 2 WHERE id = 'i1'"), "OK")
+expect("item version goes backwards", write("UPDATE items SET name = 'Dal', version = 1 WHERE id = 'i1'"),
+       "item_version_not_bumped")
+
+
+def price(store, qty, version, valid_from, amount=4000):
+    return write("INSERT INTO item_prices (item_id, store_id, qty_base, version, price_minor, valid_from, created_at) "
+                 "VALUES ('i2', ?, ?, ?, ?, ?, 0)", store, qty, version, amount, valid_from)
+
+
+expect("default tier set v1 (two tiers)", price(None, 1000, 1, 100) + "/" + price(None, 500, 1, 100, 2500), "OK/OK")
+expect("store override reuses v1", price("s1", 1000, 1, 100, 3900), "price_version_scope")
+expect("store override takes v2", price("s1", 1000, 2, 100, 3900), "OK")
+expect("default v3 while v1 tiers still open (half-open)", price(None, 1000, 3, 200), "price_revision_mixed")
+write("UPDATE item_prices SET valid_to = 200 WHERE item_id = 'i2' AND store_id IS NULL AND valid_to IS NULL")
+expect("default v3 after closing every v1 tier", price(None, 1000, 3, 200, 4200) + "/" +
+       price(None, 500, 3, 200, 2600), "OK/OK")
+expect("older version inserted after a newer one", price("s2", 1000, 2, 300), "price_version_scope")
+
 expect("schema_version after all migrations", con.execute("SELECT schema_version FROM schema_meta").fetchone(),
        (len(list((here / "migrations").glob("*.sql"))) + 1,))
 

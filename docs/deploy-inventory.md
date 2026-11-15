@@ -209,6 +209,7 @@ yet, so 0007 was rewritten in place and 0008 is new.
 | `AFTER INSERT ON bills` maintains `sales_daily`; `AFTER INSERT ON bill_voids` decrements it | A duplicate push fires no AFTER INSERT trigger, so a replay cannot double-count; the header-last batch order lets the trigger reconcile against its lines (T4). |
 | `bills.business_day_start_minutes` | The day boundary is copied at sale time, so a settings change never re-dates an old bill (D42). |
 | `bill_lines.approval_grant_id` | Names the grant that authorised an override; the server counts uses against `max_overrides` (D33). |
+| `items.version`, `bill_lines.item_version`, and price-version triggers (`trg_items_version`, `trg_item_prices_version_scope`, `trg_item_prices_revision_coherent`) | The register's catalog is the truth for a sale; a line names the exact item and price versions it used, and a price write cannot leave a half-open tier set (D26). |
 | `schema_meta.archive_before`, `BEFORE DELETE ON bills` raising `bill_not_archivable` | The archive watermark and the guard that stops a delete of anything newer than it (T8). |
 | `BEFORE DELETE` triggers on `devices` and `shifts` (`staff_sessions` were already `ON DELETE RESTRICT`) | A bill's parents are never deleted (D30). |
 | `idx_bills_store_date` rebuilt non-partial, with `voided` in the key | The archive export walks one store-month; the old partial index (`WHERE voided = 0`) cannot serve that range, so the export becomes a range seek instead of a scan |
