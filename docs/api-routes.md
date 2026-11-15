@@ -121,8 +121,11 @@ the admin web.
 | PUT | `/v1/admin/items/:id/identifiers` | owner + CSRF | replace one store's identifier set | **yes** — same set is a no-op | `{item_id, store_id, identifiers[], catalog:{epoch,head}}` | `404 not_found`, `409 identifier_conflict`, `422 validation_failed` |
 | GET | `/v1/admin/items/:id/history` | session | price versions for the item | read | `{item_id, prices[], next_cursor, has_more}` | `404 not_found` |
 | GET | `/v1/admin/items/:id/batches` | session | the item's batches in a store, with on-hand, MRP, expiry, open prices (D27) | read | `{item_id, store_id, batches[], next_cursor, has_more}` | `403 store_forbidden`, `404 not_found` |
-| POST | `/v1/admin/items/:id/batches` | owner + CSRF | receive stock: create a batch (`store_id`, `batch_no`, `mrp_minor`, optional `expiry_date`, `qty_base`, `prices[]`); writes the batch, its prices and a `receipt` movement in one batch | **yes** on client `id` | `{batch, prices[], on_hand_qty_base, catalog:{epoch,head}}` | `409 batch_no_exists`, `422 validation_failed` |
-| PATCH | `/v1/admin/batches/:id` | owner + CSRF | edit `batch_no`, `mrp_minor`, `expiry_date`, or retire/unretire; bumps the batch `version` | absolute values; `If-Match` on version | `{batch, catalog:{epoch,head}}` | `404 not_found`, `409 edit_conflict`, `422 validation_failed` |
+| GET | `/v1/admin/books` | session | the store's books (stock locations) with priority; priority 1 is the main book (D28) | read | `{store_id, books[]}` | `403 store_forbidden` |
+| POST | `/v1/admin/books` | owner + CSRF | create a book (`store_id`, `name`, `priority`) | **yes** on client `id` | `{book, catalog:{epoch,head}}` | `409 book_name_exists`, `409 priority_taken`, `422 validation_failed` |
+| PATCH | `/v1/admin/books/:id` | owner + CSRF | rename, deactivate/reactivate, or reorder (`priority`); a reorder swaps through a free priority in one `db.batch()` | absolute values; `If-Match` on version | `{books[], catalog:{epoch,head}}` | `404 not_found`, `409 edit_conflict`, `422 validation_failed` |
+| POST | `/v1/admin/stock-receipts` | owner + CSRF | purchase entry into one book: `{store_id, book_id, reference, lines:[{item_id, batch_id} or {item_id, new_batch:{batch_no, mrp_minor, expiry_date?, prices[], is_primary?}}, qty_base]}`; writes the receipt, new batches, prices and one `receipt` movement per line in one `db.batch()` | **yes** on client `id` | `{receipt, book:{id,name}, lines:[{batch, on_hand_qty_base}], catalog:{epoch,head}}` | `404 not_found`, `409 batch_no_exists`, `409 receipt_book_mismatch`, `422 validation_failed` |
+| PATCH | `/v1/admin/batches/:id` | owner + CSRF | edit `batch_no`, `mrp_minor`, `expiry_date`, `is_primary` (clears the book's previous primary in the same `db.batch()`), or retire/unretire; bumps the batch `version`. `book_id` cannot change. | absolute values; `If-Match` on version | `{batch, catalog:{epoch,head}}` | `404 not_found`, `409 edit_conflict`, `422 validation_failed` |
 | POST | `/v1/admin/batches/:id/adjustments` | owner + CSRF | change quantity by a signed `qty_delta_base`, or set a counted `qty_base` (the Worker writes the difference); `reason` and `note` required | **yes** on client `id` | `{batch_id, movement, on_hand_qty_base}` | `404 not_found`, `422 validation_failed` |
 | GET | `/v1/admin/reports/sales-by-item` | session | per-item qty/amount for a date range | read | `{range, rows[], totals, provisional_until, next_cursor, has_more}` | `400 invalid_range`, `403 store_forbidden`, `413 range_too_large`, `429 rate_limited` |
 | GET | `/v1/admin/reports/day-summary` | session | totals per business date/store | read | `{range, rows[], totals, provisional_until, next_cursor, has_more}` | `400 invalid_range`, `403 store_forbidden`, `413 range_too_large` |
@@ -237,14 +240,17 @@ above say 1,000 g sells for 4,000 and 500 g for 2,500. A bill line is different:
 `list_price_minor` are rates per `price_basis_qty_base` (D23), and its `price_breakdown.parts` copy the
 tier rows it used, so the parts sum to the line's `list_amount_minor`.
 
-**Batches (D27).** For an item with `uses_batches`, stock arrives in batches: soap received in April at MRP
-₹100 and in May at MRP ₹200 are two `item_batch` documents, each with its own price set (`item_price` rows
-carrying `batch_id`), MRP and optional `expiry_date`. At scan the register lists the store's batches that
-are neither retired nor expired, showing every batch with stock above zero plus the newest batch always,
-newest first. One batch bills directly. Two or more show a picker with batch number, MRP, selling price
-and on-hand, and the cashier picks the batch whose MRP is printed on the pack; nothing is preselected.
-Expired batches show struck out and cannot be picked. On-hand comes from `GET /v1/stock` minus this
-register's unsynced sales; it is an estimate and never blocks a sale.
+**Batches and books (D27, D28).** For an item with `uses_batches`, stock arrives in batches: soap received
+in April at MRP ₹100 and in May at MRP ₹200 are two `item_batch` documents, each with its own price set
+(`item_price` rows carrying `batch_id`), MRP, optional `expiry_date`, `is_primary`, and the `book_id` of the
+stock location it lives in. `book` documents carry name and priority. At scan the register lists the store's
+batches that are neither retired nor expired, in active books: every batch with stock above zero plus the
+newest batch always. One batch bills directly. Two or more show a picker with book, batch number, MRP,
+selling price and on-hand, with a default preselected: a stocked batch in the lowest-priority book, its
+primary first, then the newest; if nothing has stock, the newest batch. The cashier can change the batch on
+the line before completing the bill. Expired batches show struck out and cannot be picked. On-hand comes
+from `GET /v1/stock` minus this register's unsynced sales; it is an estimate and never blocks a sale, and a
+quantity above a batch's on-hand shows a warning.
 
 Snapshot is paged, never one unbounded response:
 `GET /v1/catalog?snapshot=1&epoch=1&snapshot_page=items&snapshot_cursor=...&limit=500`.

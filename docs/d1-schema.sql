@@ -259,8 +259,8 @@ CREATE TABLE IF NOT EXISTS item_identifiers (
 CREATE TABLE IF NOT EXISTS catalog_changes (
   seq         INTEGER PRIMARY KEY,
   entity      TEXT NOT NULL CHECK (entity IN (
-                'item', 'item_price', 'item_identifier', 'item_batch', 'unit', 'tax_rate', 'user',
-                'store', 'store_settings', 'numbering_policy', 'terminal_config')),
+                'item', 'item_price', 'item_identifier', 'item_batch', 'book', 'unit', 'tax_rate',
+                'user', 'store', 'store_settings', 'numbering_policy', 'terminal_config')),
   entity_id   TEXT NOT NULL,
   op          TEXT NOT NULL CHECK (op IN ('upsert', 'delete')),
   version     INTEGER CHECK (version IS NULL OR version > 0),

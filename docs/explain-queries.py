@@ -64,14 +64,18 @@ QUERIES = {
         "SELECT price_minor, version FROM item_prices WHERE item_id = ? AND qty_base = ? "
         "AND (store_id IS ? OR store_id IS NULL) AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) "
         "ORDER BY store_id IS NULL, valid_from DESC LIMIT 1"),
-    "batch picker (register, at scan)": (
-        "WITH live AS (SELECT b.id, b.batch_no, b.mrp_minor, b.expiry_date, b.received_at, "
-        "IFNULL(s.on_hand_qty_base, 0) AS on_hand FROM item_batches b "
+    "batch picker with default (register, at scan)": (
+        "WITH live AS (SELECT b.id, b.batch_no, b.mrp_minor, b.expiry_date, b.received_at, b.is_primary, "
+        "k.priority, k.name AS book, IFNULL(s.on_hand_qty_base, 0) AS on_hand FROM item_batches b "
+        "JOIN books k ON k.id = b.book_id AND k.active = 1 "
         "LEFT JOIN batch_stock s ON s.batch_id = b.id WHERE b.item_id = ? AND b.store_id = ? "
-        "AND b.retired_at IS NULL AND (b.expiry_date IS NULL OR b.expiry_date >= ?)) "
-        "SELECT * FROM live WHERE on_hand > 0 "
-        "OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1) "
-        "ORDER BY received_at DESC, id DESC"),
+        "AND b.retired_at IS NULL AND (b.expiry_date IS NULL OR b.expiry_date >= ?)), "
+        "shown AS (SELECT * FROM live WHERE on_hand > 0 "
+        "OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1)), "
+        "pick AS (SELECT id FROM shown ORDER BY on_hand > 0 DESC, priority, is_primary DESC, "
+        "received_at DESC, id DESC LIMIT 1) "
+        "SELECT shown.*, id = (SELECT id FROM pick) AS is_default FROM shown "
+        "ORDER BY is_default DESC, priority, is_primary DESC, received_at DESC, id DESC"),
     "batch prices (register, after pick)": (
         "SELECT qty_base, price_minor, mrp_minor, version FROM item_prices "
         "WHERE item_id = ? AND batch_id = ? AND valid_to IS NULL ORDER BY qty_base"),

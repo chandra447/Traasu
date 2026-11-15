@@ -509,7 +509,7 @@ serial numbers) into v1. Stock is now tracked per batch but still never blocks a
 
 | GoFrugal | Source | Here |
 |---|---|---|
-| A purchase or opening-stock entry with different price details creates a batch | [Sales – Batch LOV](https://help.serveeasy.gofrugal.com/Sales-Batch-LOV.html) | Admin "receive stock" creates a batch (no purchase module in v1) |
+| A purchase or opening-stock entry with different price details creates a batch | [Sales – Batch LOV](https://help.serveeasy.gofrugal.com/Sales-Batch-LOV.html) | A stock receipt (purchase entry) into a book creates a batch, or adds to an existing one (D28). No purchase module in v1. |
 | Batch has number, MRP, selling price, quantity, expiry; expiry optional or mandatory per item | [Batch and Expiry](https://community.gofrugal.com/portal/en/kb/gofrugalretaileasy/inventory-management/physical-inventory/articles/batch-and-expiry) | Same; expiry is optional (`NULL` = never expires) |
 | At billing a batch popup lists batches; the cashier selects; price follows the batch | Batch LOV | Same, with the visibility rule below |
 | Expired batches are struck out and cannot be sold | Batch and Expiry | Same |
@@ -536,9 +536,10 @@ expired, and shows:
 - every batch with stock on hand above zero, **and**
 - the newest batch always, even at zero or below.
 
-Newest first. One batch listed: it bills directly, no prompt. Two or more: the cashier picks the batch whose
-MRP is printed on the pack; nothing is preselected. So when the April batch sells out, the cashier only sees
-May. Expired batches show struck out and cannot be picked.
+One batch listed: it bills directly, no prompt. Two or more: the register preselects a default (D28: main
+book first, its primary batch first), and the cashier can change it on the line before completing the bill.
+So when the April batch sells out, the cashier only sees May. Expired batches show struck out and cannot be
+picked.
 
 ### Quantity across registers
 
@@ -568,3 +569,75 @@ Cost:
 - `inventory_movements` stops being optional, so the ~25% saving from dropping it (D18) is gone for batched items.
 - Archival deletes old sale movements by cascade; `batch_stock` keeps the balance and the R2 export keeps the
   history, so on-hand cannot be rebuilt from D1 alone after archival.
+
+## D28. Books (stock locations) and the primary batch
+
+A **book** is a stock location inside one store: shop floor, godown, back room. It is GoFrugal's godown: a
+purchase entry picks the godown, and its stock lands there
+([Godown-wise transactions](https://community.gofrugal.com/portal/en/kb/gofrugalmanageeasy/inventory-management/customer-category-wise-sales-bill/articles/godown-wise-transactions-6-8-2020)).
+A book is not a legal entity: one GSTIN, one invoice series, one bill.
+
+### Data (0008)
+
+| Table / column | Holds |
+|---|---|
+| `books` | `store_id`, `name`, `priority` (1 = main book), `active`, `version`. One active book per priority per store. Never deleted. |
+| `item_batches.book_id` | The book a batch lives in. Fixed for the batch's life: moving stock between books is a transfer, not an edit. |
+| `item_batches.is_primary` | The batch preselected within its book. At most one live primary per item per book. |
+| `stock_receipts` | One purchase entry: `store_id`, `book_id`, `reference` (supplier bill no.), `received_at`. Its `receipt` movements must land in batches of that book. |
+
+Provisioning creates a book named "Main" with priority 1 for every store, so a store that never uses books
+still has one.
+
+### Purchase entry (admin)
+
+1. The admin picks the store and the book. The screen header shows the book name for the whole entry.
+2. For each line: pick an existing batch in that book (adds stock), or create a new batch with batch number,
+   MRP, optional expiry, selling prices and an optional "primary" tick. Following GoFrugal, different price
+   details mean a new batch; the screen offers the existing batch when MRP and price match.
+3. Save writes the receipt, the new batches and their prices, and one `receipt` movement per line in one
+   `db.batch()`.
+
+Switching book starts a new entry, so one entry never mixes books.
+
+### Which batch the register preselects
+
+The visible list is unchanged from D27: every batch with stock, plus the newest batch always. The default
+is the first match of:
+
+1. A batch **with stock**, in the book with the **lowest priority number**; within that book, the **primary**
+   batch first, then the newest.
+2. If no batch has stock: the newest batch.
+
+So stock is used from the main book first, and falls back to the next book only when the main book has none
+of that item. If the primary batch is sold out but another batch in the same book has stock, the default is
+that other batch. One batch listed means it is primary by definition and bills with no prompt. The cashier can
+change the batch on any line before completing the bill.
+
+| Main book | Godown | Default |
+|---|---|---|
+| A (primary, 5), B (3) | C (10) | A |
+| A (0), B (3) | C (10) | B |
+| A (0), B (0) | C (10) | C |
+| A restocked (2), B (0) | C (10) | A |
+
+`check-invariants.py` runs this table.
+
+GoFrugal goes one step further: when the quantity entered exceeds the chosen batch, it takes the rest from
+another batch in the same location
+([RPOS7 RC99.94](https://cdn-download.gofrugal.com/GoFrugal_RPOS7/RC99/EXT_95/Releasenotes.html)). We do not
+split a line automatically in v1: stock is an offline estimate, and one line stays one batch, one price. The
+register warns when the quantity exceeds the batch's on-hand, and the cashier can add a second line from
+another batch.
+
+### Admin rules
+
+| Action | Rule |
+|---|---|
+| Set a batch as primary | Clear the old primary and set the new one in one `db.batch()`, each with `version + 1` |
+| Reorder books | SQLite checks the unique priority row by row, so a one-statement swap fails (tested). Park one book on a free priority, move the other, then set the first: three updates in one `db.batch()`. |
+| Deactivate a book | Its batches drop out of the register's list. Stock in it stays recorded and returns if the book is reactivated. |
+| Move stock between books | A transfer (not built yet): an `out` movement from the batch in book A and an `in` movement to a matching batch in book B. GoFrugal calls this a Godown Transfer. |
+
+Cost: one more join per scan (indexed), one more table to sync (`book` catalog entity), and a purchase entry
+screen. Without a transfer, stock received into the wrong book is fixed with two adjustments.

@@ -178,40 +178,54 @@ expect("default v3 after closing every v1 tier", price(None, 1000, 3, 200, 4200)
        price(None, 500, 3, 200, 2600), "OK/OK")
 expect("older version inserted after a newer one", price("s2", 1000, 2, 300), "price_version_scope")
 
-# Batches (D27): soap received in April at MRP 100 and in May at MRP 200, both on the shelf in store s1
+# Batches (D27) and books (D28): soap received in April at MRP 100 and in May at MRP 200, in store s1
 write("INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, uses_batches, updated_at) "
-      "VALUES ('soap', 'Soap', 'count', 'fixed_only', 'pcs', 'pcs', 1, 0)")
+      "VALUES ('soap', 'Soap', 'count', 'fixed_only', 'pcs', 'pcs', 1, 0), "
+      "('oil', 'Oil', 'count', 'fixed_only', 'pcs', 'pcs', 1, 0)")
+expect("books: Main (1) and Godown (2) in s1", write(
+    "INSERT INTO books (id, store_id, name, priority, created_at, updated_at) VALUES "
+    "('k_main', 's1', 'Main', 1, 0, 0), ('k_godown', 's1', 'Godown', 2, 0, 0)"), "OK")
 
 
-def batch(bid, no, mrp, received_at, expiry=None, store="s1"):
-    return write("INSERT INTO item_batches (id, item_id, store_id, batch_no, mrp_minor, expiry_date, received_at, "
-                 "updated_at) VALUES (?, 'soap', ?, ?, ?, ?, ?, 0)", bid, store, no, mrp, expiry, received_at)
+def batch(bid, no, mrp, received_at, expiry=None, store="s1", book="k_main", item="soap", primary=0):
+    return write("INSERT INTO item_batches (id, item_id, store_id, book_id, batch_no, mrp_minor, expiry_date, "
+                 "is_primary, received_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                 bid, item, store, book, no, mrp, expiry, primary, received_at)
 
 
-def move(mid, bid, direction, qty, reason, bill=None, line_no=None):
+def move(mid, bid, direction, qty, reason, bill=None, line_no=None, item="soap", receipt=None):
     return write("INSERT INTO inventory_movements (id, item_id, bill_id, bill_line_no, direction, qty_base, occurred_at, "
-                 "created_at, batch_id, store_id, reason) VALUES (?, 'soap', ?, ?, ?, ?, 0, 0, ?, 's1', ?)",
-                 mid, bill, line_no, direction, qty, bid, reason)
+                 "created_at, batch_id, store_id, reason, receipt_id) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 's1', ?, ?)",
+                 mid, item, bill, line_no, direction, qty, bid, reason, receipt)
 
 
 def on_hand(bid):
     return con.execute("SELECT on_hand_qty_base FROM batch_stock WHERE batch_id = ?", (bid,)).fetchone()[0]
 
 
+# The register's batch list (query-catalogue.md §3). First row is the preselected default.
 PICKER = """
 WITH live AS (
-  SELECT b.id, b.received_at, IFNULL(s.on_hand_qty_base, 0) AS on_hand
-  FROM item_batches b LEFT JOIN batch_stock s ON s.batch_id = b.id
+  SELECT b.id, k.priority, b.is_primary, b.received_at, IFNULL(s.on_hand_qty_base, 0) AS on_hand
+  FROM item_batches b
+  JOIN books k ON k.id = b.book_id AND k.active = 1
+  LEFT JOIN batch_stock s ON s.batch_id = b.id
   WHERE b.item_id = ?1 AND b.store_id = ?2 AND b.retired_at IS NULL
-    AND (b.expiry_date IS NULL OR b.expiry_date >= ?3))
-SELECT id FROM live
-WHERE on_hand > 0 OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1)
-ORDER BY received_at DESC, id DESC
+    AND (b.expiry_date IS NULL OR b.expiry_date >= ?3)),
+shown AS (
+  SELECT * FROM live
+  WHERE on_hand > 0 OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1)),
+pick AS (
+  SELECT id FROM shown ORDER BY on_hand > 0 DESC, priority, is_primary DESC, received_at DESC, id DESC LIMIT 1)
+SELECT id FROM shown
+ORDER BY id = (SELECT id FROM pick) DESC, priority, is_primary DESC, received_at DESC, id DESC
 """
 
 
-def picker(day="2026-11-14"):
-    return [r[0] for r in con.execute(PICKER, ("soap", "s1", day))]
+def picker(day="2026-11-14", item="soap"):
+    return [r[0] for r in con.execute(PICKER, (item, "s1", day))]
+
+
 
 
 expect("April batch, no expiry", batch("b_apr", "APR-24", 10000, 100), "OK")
@@ -236,7 +250,7 @@ expect("May sold out too (stock count)", move("a1", "b_may", "out", 24, "adjustm
 expect("picker: the newest batch always shows", picker(), ["b_may"])
 expect("sell past zero offline", move("s2m", "b_may", "out", 2, "sale") + "/" + str(on_hand("b_may")), "OK/-2")
 expect("April restocked: shows again", move("r4", "b_apr", "in", 6, "receipt") + "/" + ",".join(picker()),
-       "OK/b_may,b_apr")
+       "OK/b_apr,b_may")
 expect("void puts the goods back", push("bsoap", [line(1, item="soap")]) + "/" +
        move("s3m", "b_apr", "out", 1, "sale", bill="bsoap", line_no=1) + "/" + str(on_hand("b_apr")) + "/" +
        write("INSERT INTO bill_voids (id, bill_id, store_id, terminal_id, user_id, reason, created_at) "
@@ -251,6 +265,44 @@ expect("delete a batch", write("DELETE FROM item_batches WHERE id = 'b_apr'"), "
 expect("archival does not change stock", write("UPDATE schema_meta SET archive_before = '2026-12-01'") + "/" +
        write("DELETE FROM bill_voids WHERE bill_id = 'bsoap'") + "/" + write("DELETE FROM bills WHERE id = 'bsoap'") +
        "/" + str(on_hand("b_apr")), "OK/OK/OK/6")
+
+# Books and primary batch (D28): oil in the Main book (A primary, B newer) and the Godown (C)
+expect("A: Main book, primary", batch("o_a", "OIL-A", 15000, 100, item="oil", primary=1), "OK")
+expect("B: Main book, newer", batch("o_b", "OIL-B", 16000, 200, item="oil"), "OK")
+expect("C: Godown, newest", batch("o_c", "OIL-C", 16000, 300, item="oil", book="k_godown"), "OK")
+expect("second primary in the same book", batch("o_x", "OIL-X", 1, 400, item="oil", primary=1),
+       "UNIQUE constraint failed: item_batches.item_id, item_batches.book_id")
+expect("batch in a book of another store", batch("o_y", "OIL-Y", 1, 400, item="oil", store="s2"),
+       "batch_book_store_mismatch")
+expect("purchase entry into the Godown", write(
+    "INSERT INTO stock_receipts (id, store_id, book_id, reference, received_at) "
+    "VALUES ('pr1', 's1', 'k_godown', 'INV-778', 300)"), "OK")
+expect("Godown receipt line into a Main-book batch", move("ro0", "o_a", "in", 5, "receipt", item="oil",
+                                                          receipt="pr1"), "receipt_book_mismatch")
+expect("stock in: A 5, B 3, C 10", "/".join([
+    move("ro1", "o_a", "in", 5, "receipt", item="oil"), move("ro2", "o_b", "in", 3, "receipt", item="oil"),
+    move("ro3", "o_c", "in", 10, "receipt", item="oil", receipt="pr1")]), "OK/OK/OK")
+expect("default is the Main book's primary", picker(item="oil"), ["o_a", "o_b", "o_c"])
+expect("primary sold out: next stocked batch in Main", move("so1", "o_a", "out", 5, "sale", item="oil") + "/" +
+       ",".join(picker(item="oil")), "OK/o_b,o_c")
+expect("Main book empty: fall back to the Godown", move("so2", "o_b", "out", 3, "sale", item="oil") + "/" +
+       ",".join(picker(item="oil")), "OK/o_c")
+expect("Main restocked: Main's primary is the default again", move("ro4", "o_a", "in", 2, "receipt", item="oil") +
+       "/" + ",".join(picker(item="oil")), "OK/o_a,o_c")
+expect("move a batch to another book", write("UPDATE item_batches SET book_id = 'k_godown', version = 2 "
+                                             "WHERE id = 'o_b'"), "batch_version_not_bumped")
+expect("make B primary: clear A, then set B", write(
+    "UPDATE item_batches SET is_primary = 0, version = 2 WHERE id = 'o_a'") + "/" + write(
+    "UPDATE item_batches SET is_primary = 1, version = 2 WHERE id = 'o_b'"), "OK/OK")
+expect("swap book priorities in one statement", write(
+    "UPDATE books SET priority = CASE id WHEN 'k_main' THEN 2 ELSE 1 END, version = 2 WHERE store_id = 's1'"),
+    "UNIQUE constraint failed: books.store_id, books.priority")
+expect("swap via a free priority (one db.batch)", "/".join([
+    write("UPDATE books SET priority = 3, version = 2 WHERE id = 'k_main'"),
+    write("UPDATE books SET priority = 1, version = 2 WHERE id = 'k_godown'"),
+    write("UPDATE books SET priority = 2, version = 3 WHERE id = 'k_main'")]), "OK/OK/OK")
+expect("Godown is now first", ",".join(picker(item="oil")), "o_c,o_a")
+expect("delete a book", write("DELETE FROM books WHERE id = 'k_godown'"), "book_deactivate_only")
 
 expect("schema_version after all migrations", con.execute("SELECT schema_version FROM schema_meta").fetchone(),
        (len(list((here / "migrations").glob("*.sql"))) + 1,))

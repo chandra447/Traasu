@@ -68,22 +68,30 @@ it prices the batch the cashier billed. The register's scan lookup lists the bat
 taking one price:
 
 ```sql
--- ?1 item, ?2 store, ?3 business date
+-- ?1 item, ?2 store, ?3 business date. First row is the default the register preselects (D28).
 WITH live AS (
-  SELECT b.id, b.batch_no, b.mrp_minor, b.expiry_date, b.received_at,
-         IFNULL(s.on_hand_qty_base, 0) AS on_hand
-  FROM item_batches b LEFT JOIN batch_stock s ON s.batch_id = b.id
+  SELECT b.id, b.batch_no, b.mrp_minor, b.expiry_date, b.received_at, b.is_primary,
+         k.priority, k.name AS book, IFNULL(s.on_hand_qty_base, 0) AS on_hand
+  FROM item_batches b
+  JOIN books k ON k.id = b.book_id AND k.active = 1
+  LEFT JOIN batch_stock s ON s.batch_id = b.id
   WHERE b.item_id = ?1 AND b.store_id = ?2 AND b.retired_at IS NULL
-    AND (b.expiry_date IS NULL OR b.expiry_date >= ?3))
-SELECT * FROM live
-WHERE on_hand > 0
-   OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1)   -- newest always shows
-ORDER BY received_at DESC, id DESC;
+    AND (b.expiry_date IS NULL OR b.expiry_date >= ?3)),
+shown AS (                                   -- stocked batches, plus the newest always
+  SELECT * FROM live
+  WHERE on_hand > 0 OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1)),
+pick AS (                                    -- main book first, primary first, then newest
+  SELECT id FROM shown
+  ORDER BY on_hand > 0 DESC, priority, is_primary DESC, received_at DESC, id DESC LIMIT 1)
+SELECT shown.*, id = (SELECT id FROM pick) AS is_default
+FROM shown
+ORDER BY is_default DESC, priority, is_primary DESC, received_at DESC, id DESC;
 ```
 
-More than one row means the cashier picks; the picked batch's prices are
-`SELECT ... FROM item_prices WHERE item_id = ?1 AND batch_id = ?4 AND valid_to IS NULL`. Plans on
-`idx_item_batches_live`, the `batch_stock` primary key and `uq_item_prices_open`.
+More than one row means the cashier sees the list with the default preselected and can change it; the
+chosen batch's prices are `SELECT ... FROM item_prices WHERE item_id = ?1 AND batch_id = ?4 AND valid_to IS
+NULL`. Plans on `idx_item_batches_live`, the `books` and `batch_stock` primary keys, and
+`uq_item_prices_open` (`explain-queries.py`).
 
 Stock pull (`GET /v1/stock?since=`), store-scoped, by the `stock_seq` cursor:
 
