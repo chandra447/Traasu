@@ -49,6 +49,30 @@ All tools and tasks come from `mise.toml`; do not install Python, Go, Node or th
 3. Review, then `/openspec-apply-change`; implement only those requirements. A spec gap is reported, not invented.
 4. `mise run check` (if DDL changed) and `mise run spec:validate`, then `/openspec-archive-change` and set the story's status.
 
+## poteto-mode with OpenSpec
+
+OpenSpec decides what is built and keeps the artifacts; `/poteto-mode` (skill at `~/.agents/skills/poteto-mode`)
+decides how the agent works while building it. Use it for stories that touch more than one capability or have
+more than one valid design (E0-S01, E6, E7). For a one-trigger or one-index fix (E0-S02), plain OpenSpec is enough.
+
+| OpenSpec step | poteto-mode step | Notes |
+|---|---|---|
+| `/openspec-explore` | `how` over the affected subsystem | Read-only; produces the shape, not files |
+| `/openspec-propose` | `architect` (parallel design options); `interrogate` if contested | The chosen design goes into `design.md`. Architecture is settled here, never during apply |
+| `/openspec-apply-change` | Feature playbook steps 3–6: throughput checkpoint, delegate code with a named data shape, verify on the real surface, small ordered commits | `tasks.md` is the source of truth; the poteto todo list is the session's working copy |
+| `/openspec-archive-change` | Opening a PR, then Babysit to drive CI green | Archive closes the spec; the PR ships the code |
+
+Start a story with: `/poteto-mode implement <story-id> from openspec/roadmap.md`. Bugs in built behavior use
+its Bug fix playbook, with the fix proposed as a `MODIFIED` delta.
+
+On this machine (checked 2026-11-15):
+
+- Installed: `how`, `why`, `architect`, `arena`, `swarm`, `interrogate`, `unslop`, `no-comments`,
+  `technical-writing`, `benchmark-checklist`, `figure-it-out`.
+- Not installed: `deslop`, `control-cli`, `control-ui` (Cursor plugin). Skip those steps and say so in the PR.
+- omp has no `poteto-agent` type: delegate to the `task` agent with the model from `~/.agents/pstack-models.md`.
+- `mise run check` and `mise run spec:validate` are the gates whichever skill drives the work.
+
 ## Rules that never bend
 
 - Money is integer paise; quantities are integer base units (g, ml, pcs). No floats anywhere.

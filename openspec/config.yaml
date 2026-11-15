@@ -33,11 +33,14 @@ rules:
   tasks:
     - Split by deliverable (register, worker, admin web, DDL) and keep each task under half a day.
     - The last task of any change that touches DDL runs the three docs/ checks.
+  design:
+    - When the change admits more than one valid design, compare them (poteto-mode `architect`) and record the pick and the rejected options with reasons.
 
 operations:
   apply:
     guidance:
       - Implement only the requirements the proposal names; report any spec gap instead of inventing behavior.
+      - Treat design.md as the approved design; for multi-capability stories follow the poteto-mode Feature playbook from step 3 (see AGENTS.md).
   archive:
     guidance:
       - Update the story status in openspec/roadmap.md when archiving.
