@@ -29,10 +29,13 @@ rules:
     - No library, function or file-layout choices in specs; those go in design.md of a change.
   proposal:
     - Name the roadmap story id (e.g. E4-S02) and the requirements it implements.
+    - 'List them under a "## Requirements" heading, one per line as "- <capability>: <Requirement name>" (exact names); docs/check-spec-coverage.py reads this list.'
     - State what is out of scope.
   tasks:
     - Split by deliverable (register, worker, admin web, DDL) and keep each task under half a day.
     - The last task of any change that touches DDL runs the three docs/ checks.
+    - 'Every scenario of every listed requirement gets a test whose file contains the exact scenario name, or a check-invariants case the scenario cites. The last task runs "mise run spec:coverage openspec/changes/<change>".'
+    - For multi-capability or risky stories, run poteto-mode interrogate on the change folder before the first code task; findings change the delta spec or add scenarios.
   design:
     - When the change admits more than one valid design, compare them (poteto-mode `architect`) and record the pick and the rejected options with reasons.
 

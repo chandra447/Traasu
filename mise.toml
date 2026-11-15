@@ -19,8 +19,13 @@ dir = "docs"
 run = "python capacity-bench.py"
 
 [tasks."spec:validate"]
-description = "Validate every OpenSpec spec and change"
-run = "openspec validate --all --strict --no-interactive"
+description = "Validate every OpenSpec spec and change, then the scenario-to-test coverage of archived changes"
+run = ["openspec validate --all --strict --no-interactive", "python docs/check-spec-coverage.py"]
+
+[tasks."spec:coverage"]
+description = "Coverage gate for one in-flight change: mise run spec:coverage openspec/changes/<story>"
+usage = 'arg "<change>" help="change folder"'
+run = 'python docs/check-spec-coverage.py --change {{usage.change}}'
 
 [tasks."spec:list"]
 description = "List capabilities and in-flight changes"

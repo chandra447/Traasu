@@ -22,7 +22,8 @@ All tools and tasks come from `mise.toml`; do not install Python, Go, Node or th
 | Task | Runs |
 |---|---|
 | `mise run check` | `docs/check-schema.py`, `check-invariants.py`, `explain-queries.py`: required after any DDL change, before every commit |
-| `mise run spec:validate` | `openspec validate --all --strict` |
+| `mise run spec:validate` | `openspec validate --all --strict`, then `docs/check-spec-coverage.py` over archived changes |
+| `mise run spec:coverage <change>` | coverage gate for one in-flight change, before archiving it |
 | `mise run spec:list` | capabilities and in-flight changes |
 | `mise run check:capacity` | bytes per bill on the real schema (~4 min, optional) |
 | `mise run gofrugal:fetch` | refresh the local GoFrugal help copy (see below) |
@@ -39,15 +40,21 @@ All tools and tasks come from `mise.toml`; do not install Python, Go, Node or th
 | `docs/d1-schema.sql`, `docs/migrations/` | DDL: 0001 + 0002–0008. Same DDL on D1 and the register's SQLite. |
 | `docs/api-routes.md`, `docs/query-catalogue.md` | Route contract and the queries the schema must serve. |
 | `docs/check-invariants.py` | Executable rules; its case labels are the scenarios specs cite. |
+| `docs/check-spec-coverage.py` | Fails if a scenario a change implements has no test naming it, or a spec cites a missing check case. |
 | `docs/gofrugal-parity.md` | Feature-by-feature comparison with GoFrugal and the open findings. |
 | `reference/gofrugal/` | Local Markdown copy of GoFrugal help, git-ignored on purpose (copyright, robots.txt). May be absent. |
 
 ## Workflow (OpenSpec)
 
 1. Take the next `Ready` story from `openspec/roadmap.md`.
-2. `/openspec-propose <story-id>`: the change names the story id and the requirements it implements.
+2. `/openspec-propose <story-id>`: the proposal lists the requirements it implements under `## Requirements`,
+   one per line as `- <capability>: <Requirement name>`.
 3. Review, then `/openspec-apply-change`; implement only those requirements. A spec gap is reported, not invented.
-4. `mise run check` (if DDL changed) and `mise run spec:validate`, then `/openspec-archive-change` and set the story's status.
+4. **Every scenario is a test.** Each scenario of a listed requirement gets a test whose file contains the exact
+   scenario name, or a `check-invariants.py` case the scenario cites. `mise run spec:coverage openspec/changes/<story>`
+   must pass.
+5. `mise run check` (if DDL changed) and `mise run spec:validate`, then `/openspec-archive-change` and set the story's
+   status. Archived changes stay under the coverage gate, so a deleted test fails `spec:validate`.
 
 ## poteto-mode with OpenSpec
 
