@@ -64,33 +64,39 @@ number of open rows per scope and MRP variant, so the temp b-tree is over a hand
 worth an expression index. Measured plans: `docs/explain-queries.py`.
 
 For a batched item (D27) the server adds `AND batch_id IS ?5`, where `?5` is the line's `batch_id`, so
-it prices the batch the cashier billed. The register's scan lookup returns the latest batch, which a new
-line always uses, followed by the batches to mention in the MRP prompt (D28):
+it prices the batch the cashier billed. The register's scan lookup returns the batch a new line uses, then
+the batches to mention in the prompt (D28). The latest batch sets the MRP and price; among batches with that
+same MRP and price, stock is taken from book 1 first, then the next book; if none has stock, book 1 again.
 
 ```sql
--- ?1 item, ?2 store, ?3 business date
+-- ?1 item, ?2 store, ?3 business date, ?4 the tier qty_base being sold (1 for a piece)
 WITH live AS (
   SELECT b.id, b.batch_no, b.mrp_minor, b.expiry_date, b.received_at,
-         k.priority, k.name AS book, IFNULL(s.on_hand_qty_base, 0) AS on_hand
+         k.priority, k.name AS book, IFNULL(s.on_hand_qty_base, 0) AS on_hand, p.price_minor
   FROM item_batches b
   JOIN books k ON k.id = b.book_id AND k.active = 1
   LEFT JOIN batch_stock s ON s.batch_id = b.id
+  LEFT JOIN item_prices p ON p.item_id = b.item_id AND p.batch_id = b.id
+                         AND p.qty_base = ?4 AND p.valid_to IS NULL
   WHERE b.item_id = ?1 AND b.store_id = ?2 AND b.retired_at IS NULL
     AND (b.expiry_date IS NULL OR b.expiry_date >= ?3)),
-latest AS (SELECT id, mrp_minor FROM live ORDER BY received_at DESC, id DESC LIMIT 1)
-SELECT live.*, live.id = (SELECT id FROM latest) AS is_latest
+latest AS (SELECT * FROM live ORDER BY received_at DESC, id DESC LIMIT 1),       -- sets MRP and price
+same AS (SELECT live.* FROM live, latest                                        -- same pack to the customer
+         WHERE IFNULL(live.mrp_minor, -1) = IFNULL(latest.mrp_minor, -1)
+           AND live.price_minor IS latest.price_minor),
+pick AS (SELECT id FROM same                                                    -- stock first, book 1 first
+         ORDER BY on_hand > 0 DESC, priority, received_at DESC, id DESC LIMIT 1)
+SELECT live.*, live.id = (SELECT id FROM pick) AS used
 FROM live
-WHERE live.id = (SELECT id FROM latest)                                   -- the line uses this
-   OR (live.on_hand > 0                                                    -- prompt: stock left
-       AND IFNULL(live.mrp_minor, -1) <> IFNULL((SELECT mrp_minor FROM latest), -1))  -- at another MRP
-ORDER BY is_latest DESC, live.priority, live.received_at DESC, live.id DESC;
+WHERE live.id = (SELECT id FROM pick)                                           -- the line uses this
+   OR (live.on_hand > 0 AND live.id NOT IN (SELECT id FROM same))              -- prompt: other MRP or price
+ORDER BY used DESC, live.priority, live.received_at DESC, live.id DESC;
 ```
 
-One row: no prompt. More rows: the register shows them with MRP, book, batch number and `on_hand`, and the
-cashier may switch the line. The chosen batch's prices are
-`SELECT ... FROM item_prices WHERE item_id = ?1 AND batch_id = ?4 AND valid_to IS NULL`. Plans on
-`idx_item_batches_live`, the `books` and `batch_stock` primary keys, and `uq_item_prices_open`
-(`explain-queries.py`).
+One row: no prompt. More rows: the register shows them with MRP, price, book, batch number and `on_hand`,
+and the cashier may switch the line. With no stock anywhere, `pick` lands on book 1's batch and its count goes
+negative (stock never blocks a sale). Plans on `idx_item_batches_live`, the `books` and `batch_stock` primary
+keys, and `uq_item_prices_open` (`explain-queries.py`).
 
 Stock pull (`GET /v1/stock?since=`), store-scoped, by the `stock_seq` cursor:
 

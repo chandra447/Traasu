@@ -203,32 +203,37 @@ def on_hand(bid):
     return con.execute("SELECT on_hand_qty_base FROM batch_stock WHERE batch_id = ?", (bid,)).fetchone()[0]
 
 
-# The register's scan lookup (query-catalogue.md §3, D28). First row is the latest batch, which the line
-# always uses. Any further rows are other batches with stock and a different MRP: the cashier is prompted
-# with their MRP and quantity and may switch.
+# The register's scan lookup (query-catalogue.md §3, D28). The latest batch sets the MRP and price. Among the
+# batches with that same MRP and price, the line takes one with stock from the lowest-priority book (book 1
+# first); if none has stock, book 1 again (it goes negative). First row = the batch the line uses. Further rows
+# = other batches with stock at a different MRP or price: the cashier is prompted and may switch.
 PICKER = """
 WITH live AS (
-  SELECT b.id, b.mrp_minor, k.priority, b.received_at, IFNULL(s.on_hand_qty_base, 0) AS on_hand
+  SELECT b.id, b.mrp_minor, k.priority, b.received_at, IFNULL(s.on_hand_qty_base, 0) AS on_hand, p.price_minor
   FROM item_batches b
   JOIN books k ON k.id = b.book_id AND k.active = 1
   LEFT JOIN batch_stock s ON s.batch_id = b.id
+  LEFT JOIN item_prices p ON p.item_id = b.item_id AND p.batch_id = b.id AND p.qty_base = ?4
+                         AND p.valid_to IS NULL
   WHERE b.item_id = ?1 AND b.store_id = ?2 AND b.retired_at IS NULL
     AND (b.expiry_date IS NULL OR b.expiry_date >= ?3)),
-latest AS (SELECT id, mrp_minor FROM live ORDER BY received_at DESC, id DESC LIMIT 1)
-SELECT live.id, live.mrp_minor, live.on_hand FROM live
-WHERE live.id = (SELECT id FROM latest)
-   OR (live.on_hand > 0 AND IFNULL(live.mrp_minor, -1) <> IFNULL((SELECT mrp_minor FROM latest), -1))
-ORDER BY live.id = (SELECT id FROM latest) DESC, live.priority, live.received_at DESC, live.id DESC
+latest AS (SELECT * FROM live ORDER BY received_at DESC, id DESC LIMIT 1),
+same AS (SELECT live.* FROM live, latest
+         WHERE IFNULL(live.mrp_minor, -1) = IFNULL(latest.mrp_minor, -1) AND live.price_minor IS latest.price_minor),
+pick AS (SELECT id FROM same ORDER BY on_hand > 0 DESC, priority, received_at DESC, id DESC LIMIT 1)
+SELECT id, mrp_minor, on_hand, price_minor FROM live
+WHERE id = (SELECT id FROM pick) OR (on_hand > 0 AND id NOT IN (SELECT id FROM same))
+ORDER BY id = (SELECT id FROM pick) DESC, priority, received_at DESC, id DESC
 """
 
 
-def picker(day="2026-11-14", item="soap"):
-    return [r[0] for r in con.execute(PICKER, (item, "s1", day))]
+def picker(day="2026-11-14", item="soap", tier=1):
+    return [r[0] for r in con.execute(PICKER, (item, "s1", day, tier))]
 
 
-def prompt(day="2026-11-14", item="soap"):
+def prompt(day="2026-11-14", item="soap", tier=1):
     """The other batches the cashier is told about: (batch, MRP, quantity). Empty = no prompt."""
-    return [tuple(r) for r in con.execute(PICKER, (item, "s1", day)).fetchall()[1:]]
+    return [tuple(r[:3]) for r in con.execute(PICKER, (item, "s1", day, tier)).fetchall()[1:]]
 
 
 
@@ -286,14 +291,44 @@ expect("Godown receipt line into a Main-book batch", move("ro0", "o_a", "in", 5,
 expect("stock in: A 5, B 3, C 10", "/".join([
     move("ro1", "o_a", "in", 5, "receipt", item="oil"), move("ro2", "o_b", "in", 3, "receipt", item="oil"),
     move("ro3", "o_c", "in", 10, "receipt", item="oil", receipt="pr1")]), "OK/OK/OK")
-expect("latest C is used; prompt lists A (other MRP), not B (same MRP)", prompt(item="oil"),
-       [("o_a", 15000, 5)])
-expect("A sold out: C, no prompt", move("so1", "o_a", "out", 5, "sale", item="oil") + "/" +
-       ",".join(picker(item="oil")), "OK/o_c")
+expect("same MRP in Main (B) and Godown (C): B from book 1; A prompted", picker(item="oil") + prompt(item="oil"),
+       ["o_b", "o_a", ("o_a", 15000, 5)])
+expect("A sold out: B, no prompt", move("so1", "o_a", "out", 5, "sale", item="oil") + "/" +
+       ",".join(picker(item="oil")), "OK/o_b")
 expect("A restocked: prompt again with its quantity", move("ro4", "o_a", "in", 2, "receipt", item="oil") + "/" +
        str(prompt(item="oil")), "OK/[('o_a', 15000, 2)]")
+expect("B (book 1) sold out: C from book 2", move("so3", "o_b", "out", 3, "sale", item="oil") + "/" +
+       ",".join(picker(item="oil")), "OK/o_c,o_a")
+
+# Same MRP and same price in both books (D28): dal D1 in Main (older), D2 in the Godown (latest)
+write("INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, uses_batches, updated_at) "
+      "VALUES ('dal', 'Dal', 'count', 'fixed_only', 'pcs', 'pcs', 1, 0)")
+
+
+def dal_batch(bid, book, mrp, price, received_at, version, qty):
+    return "/".join([
+        batch(bid, bid.upper(), mrp, received_at, book=book, item="dal"),
+        write("INSERT INTO item_prices (item_id, store_id, batch_id, qty_base, version, price_minor, mrp_minor, "
+              "valid_from, created_at) VALUES ('dal', 's1', ?, 1, ?, ?, ?, ?, 0)", bid, version, price, mrp, received_at),
+        move("in_" + bid, bid, "in", qty, "receipt", item="dal")])
+
+
+expect("D1 Main, D2 Godown: MRP 100, price 95, 4 and 10 in stock",
+       dal_batch("d1", "k_main", 10000, 9500, 400, 1, 4) + "|" + dal_batch("d2", "k_godown", 10000, 9500, 500, 2, 10),
+       "OK/OK/OK|OK/OK/OK")
+expect("same price in both books: book 1 first, no prompt", picker(item="dal") + prompt(item="dal"), ["d1"])
+expect("book 1 sold out: book 2", move("sd1", "d1", "out", 4, "sale", item="dal") + "/" + ",".join(picker(item="dal")),
+       "OK/d2")
+expect("both sold out: back to book 1, which goes negative",
+       move("sd2", "d2", "out", 10, "sale", item="dal") + "/" + ",".join(picker(item="dal")) + "/" +
+       move("sd3", "d1", "out", 1, "sale", item="dal") + "/" + str(on_hand("d1")), "OK/d1/OK/-1")
+expect("a batch at the same MRP but a lower price is prompted",
+       dal_batch("d3", "k_main", 10000, 9000, 450, 3, 3) + "/" + ",".join(picker(item="dal")) + "/" +
+       str(prompt(item="dal")), "OK/OK/OK/d1,d3/[('d3', 10000, 3)]")
 expect("move a batch to another book", write("UPDATE item_batches SET book_id = 'k_godown', version = 2 "
                                              "WHERE id = 'o_b'"), "batch_version_not_bumped")
+expect("B restocked: Main is book 1, so B is used", move("ro5", "o_b", "in", 1, "receipt", item="oil") + "/" +
+       ",".join(picker(item="oil")), "OK/o_b,o_a")
 expect("swap book priorities in one statement", write(
     "UPDATE books SET priority = CASE id WHEN 'k_main' THEN 2 ELSE 1 END, version = 2 WHERE store_id = 's1'"),
     "UNIQUE constraint failed: books.store_id, books.priority")
@@ -301,7 +336,7 @@ expect("swap via a free priority (one db.batch)", "/".join([
     write("UPDATE books SET priority = 3, version = 2 WHERE id = 'k_main'"),
     write("UPDATE books SET priority = 1, version = 2 WHERE id = 'k_godown'"),
     write("UPDATE books SET priority = 2, version = 3 WHERE id = 'k_main'")]), "OK/OK/OK")
-expect("book priority does not change the batch billed", picker(item="oil"), ["o_c", "o_a"])
+expect("after the swap the Godown is book 1, so C is used instead of B", picker(item="oil"), ["o_c", "o_a"])
 expect("delete a book", write("DELETE FROM books WHERE id = 'k_godown'"), "book_deactivate_only")
 
 expect("schema_version after all migrations", con.execute("SELECT schema_version FROM schema_meta").fetchone(),

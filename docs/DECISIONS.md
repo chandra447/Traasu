@@ -530,10 +530,11 @@ serial numbers) into v1. Stock is now tracked per batch but still never blocks a
 
 ### What the cashier sees
 
-A new line always uses the **latest batch** (the most recently received, not retired, not expired), even if
-its count is zero. If other batches still have stock at a **different MRP**, the register prompts the cashier
-with each one's MRP and quantity, and the cashier can switch the line to it (D28). When the April batch sells
-out, the prompt disappears. Expired batches cannot be picked.
+The latest batch (most recently received, not retired, not expired) sets the MRP and price a new line uses.
+Stock for that MRP and price is taken from book 1 first, then the next book; with none left, from book 1,
+which goes negative (D28). If other batches still have stock at a **different MRP or price**, the register
+prompts the cashier with each one's MRP and quantity, and the cashier can switch the line to it. When the
+April batch sells out, the prompt disappears. Expired batches cannot be picked.
 
 ### Quantity across registers
 
@@ -564,7 +565,7 @@ Cost:
 - Archival deletes old sale movements by cascade; `batch_stock` keeps the balance and the R2 export keeps the
   history, so on-hand cannot be rebuilt from D1 alone after archival.
 
-## D28. Books (stock locations); the latest batch with an MRP prompt
+## D28. Books (stock locations); book 1 first among same-price batches; prompt on other MRPs
 
 A **book** is a stock location inside one store: shop floor, godown, back room. It is GoFrugal's godown: a
 purchase entry picks the godown, and its stock lands there
@@ -595,24 +596,36 @@ Switching book starts a new entry, so one entry never mixes books.
 
 ### Which batch a line uses
 
-There is no primary or default batch. A new line always uses the **latest batch** of the item in the store:
-the most recently received batch that is not retired, not expired and in an active book, whatever its count.
+There is no primary or default batch. Three steps, in order:
 
-**The MRP prompt.** If other batches have stock above zero and an MRP different from the latest batch's, the
-register prompts: "Other stock: MRP ₹100 (APR-24, Main) — 6 left". The prompt lists each such batch with its
-MRP, book, batch number and quantity, ordered by book priority. The cashier keeps the latest batch or
-switches the line to the batch whose MRP is printed on the pack. Batches with the same MRP as the latest are
-not listed: they are the same pack to the customer. One query returns the latest batch first and the
-prompt rows after it (`query-catalogue.md` §3).
+1. **The latest batch sets the MRP and price.** That is the most recently received batch of the item in the
+   store that is not retired, not expired and in an active book, whatever its count.
+2. **Among batches with that same MRP and same selling price**, take one with stock from the book with the
+   lowest priority number (book 1 first, then book 2, …); within a book, the most recent.
+3. **If none of them has stock**, take book 1's batch anyway. Negative stock is always allowed (a register
+   billing offline cannot know the true count), so that batch's count goes below zero. If book 1 has no such
+   batch, the next book's.
+
+**The prompt.** If other batches have stock above zero at a different MRP or a different selling price, the
+register prompts: "Other stock: MRP ₹100 (APR-24, Main) — 6 left". It lists each with MRP, price, book,
+batch number and quantity, ordered by book priority, and the cashier can switch the line. Batches at the same
+MRP and price are not listed: they are the same pack to the customer, and step 2 already drains them in book
+order. One query returns the chosen batch first and the prompt rows after it (`query-catalogue.md` §3).
 
 | Batches (received order) | Line uses | Prompt lists |
 |---|---|---|
-| A Main MRP ₹150 (5), B Main MRP ₹160 (3), C Godown MRP ₹160 (10) | C | A, 5 left |
-| A sold out | C | nothing |
-| A restocked (2) | C | A, 2 left |
-| Book priorities swapped | C | A, 2 left |
+| A Main MRP ₹150 (5), B Main MRP ₹160 (3), C Godown MRP ₹160 (10) | B (book 1) | A, 5 left |
+| B sold out | C (book 2) | A |
+| D1 Main and D2 Godown, both MRP ₹100 at ₹95 (4, 10) | D1 | nothing |
+| D1 and D2 both sold out | D1, goes to −1 | nothing |
+| D3 Main, MRP ₹100 at ₹90 (3) added | D1 | D3, 3 left (lower price) |
+| Books reordered so the Godown is book 1 | C | A |
 
-`check-invariants.py` runs this table and the soap case.
+`check-invariants.py` runs these cases and the soap case.
+
+**Later setting, deferred safely.** A store may want negative-stock sales booked to a book other than book 1.
+That is one nullable column, `store_settings.negative_stock_book_id` (NULL = book 1), added in a later
+migration with no rebuild.
 
 GoFrugal, when the quantity entered exceeds the chosen batch, takes the rest from another batch in the same
 location ([RPOS7 RC99.94](https://cdn-download.gofrugal.com/GoFrugal_RPOS7/RC99/EXT_95/Releasenotes.html)).
@@ -628,7 +641,6 @@ line from another batch.
 | Deactivate a book | Its batches drop out of the register's lookup. Stock in it stays recorded and returns if the book is reactivated. |
 | Move stock between books | A transfer (not built yet): an `out` movement from the batch in book A and an `in` movement to a matching batch in book B. GoFrugal calls this a Godown Transfer. |
 
-Cost: one more join per scan (indexed), one more table to sync (`book` catalog entity), and a purchase entry
-screen. Without a transfer, stock received into the wrong book is fixed with two adjustments. With "latest
-batch always", older stock at the same MRP is not sold first unless the cashier switches; the batch counts
-show it.
+Cost: one more join per scan (indexed, plus the price row for the scanned tier), one more table to sync (`book`
+catalog entity), and a purchase entry screen. Without a transfer, stock received into the wrong book is fixed
+with two adjustments.

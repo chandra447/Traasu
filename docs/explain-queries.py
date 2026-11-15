@@ -64,17 +64,21 @@ QUERIES = {
         "SELECT price_minor, version FROM item_prices WHERE item_id = ? AND qty_base = ? "
         "AND (store_id IS ? OR store_id IS NULL) AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) "
         "ORDER BY store_id IS NULL, valid_from DESC LIMIT 1"),
-    "latest batch + MRP prompt (register, at scan)": (
+    "batch for a new line + prompt (register, at scan)": (
         "WITH live AS (SELECT b.id, b.batch_no, b.mrp_minor, b.expiry_date, b.received_at, "
-        "k.priority, k.name AS book, IFNULL(s.on_hand_qty_base, 0) AS on_hand FROM item_batches b "
+        "k.priority, k.name AS book, IFNULL(s.on_hand_qty_base, 0) AS on_hand, p.price_minor FROM item_batches b "
         "JOIN books k ON k.id = b.book_id AND k.active = 1 "
-        "LEFT JOIN batch_stock s ON s.batch_id = b.id WHERE b.item_id = ? AND b.store_id = ? "
+        "LEFT JOIN batch_stock s ON s.batch_id = b.id "
+        "LEFT JOIN item_prices p ON p.item_id = b.item_id AND p.batch_id = b.id AND p.qty_base = ? "
+        "AND p.valid_to IS NULL WHERE b.item_id = ? AND b.store_id = ? "
         "AND b.retired_at IS NULL AND (b.expiry_date IS NULL OR b.expiry_date >= ?)), "
-        "latest AS (SELECT id, mrp_minor FROM live ORDER BY received_at DESC, id DESC LIMIT 1) "
-        "SELECT live.*, live.id = (SELECT id FROM latest) AS is_latest FROM live "
-        "WHERE live.id = (SELECT id FROM latest) OR (live.on_hand > 0 "
-        "AND IFNULL(live.mrp_minor, -1) <> IFNULL((SELECT mrp_minor FROM latest), -1)) "
-        "ORDER BY is_latest DESC, live.priority, live.received_at DESC, live.id DESC"),
+        "latest AS (SELECT * FROM live ORDER BY received_at DESC, id DESC LIMIT 1), "
+        "same AS (SELECT live.* FROM live, latest WHERE IFNULL(live.mrp_minor, -1) = IFNULL(latest.mrp_minor, -1) "
+        "AND live.price_minor IS latest.price_minor), "
+        "pick AS (SELECT id FROM same ORDER BY on_hand > 0 DESC, priority, received_at DESC, id DESC LIMIT 1) "
+        "SELECT live.*, live.id = (SELECT id FROM pick) AS used FROM live "
+        "WHERE live.id = (SELECT id FROM pick) OR (live.on_hand > 0 AND live.id NOT IN (SELECT id FROM same)) "
+        "ORDER BY used DESC, live.priority, live.received_at DESC, live.id DESC"),
     "batch prices (register, after pick)": (
         "SELECT qty_base, price_minor, mrp_minor, version FROM item_prices "
         "WHERE item_id = ? AND batch_id = ? AND valid_to IS NULL ORDER BY qty_base"),

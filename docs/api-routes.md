@@ -243,11 +243,12 @@ tier rows it used, so the parts sum to the line's `list_amount_minor`.
 **Batches and books (D27, D28).** For an item with `uses_batches`, stock arrives in batches: soap received
 in April at MRP ₹100 and in May at MRP ₹200 are two `item_batch` documents, each with its own price set
 (`item_price` rows carrying `batch_id`), MRP, optional `expiry_date`, and the `book_id` of the stock location
-it lives in. `book` documents carry name and priority. A new line always uses the **latest batch**: the most
-recently received one that is not retired, not expired and in an active book, whatever its count. There is
-no primary or default batch. If other batches have stock above zero at a different MRP, the register prompts
-the cashier with each one's MRP, book, batch number and quantity, and the cashier can switch the line to it.
-Batches at the same MRP as the latest are not listed. Expired batches cannot be picked. On-hand comes from
+it lives in. `book` documents carry name and priority. There is no primary or default batch. The latest batch
+(most recently received, not retired, not expired, in an active book) sets the MRP and price; among batches
+with that same MRP and price, the line takes stock from book 1 first, then the next book, and with none left,
+from book 1, whose count goes negative. If other batches have stock above zero at a different MRP or price,
+the register prompts the cashier with each one's MRP, price, book, batch number and quantity, and the cashier
+can switch the line to it. Expired batches cannot be picked. On-hand comes from
 `GET /v1/stock` minus this register's unsynced sales; it is an estimate and never blocks a sale, and a
 quantity above a batch's on-hand shows a warning.
 
