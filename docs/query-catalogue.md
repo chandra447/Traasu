@@ -60,9 +60,26 @@ flagged.
 Needs `(item_id, store_id, valid_from)` (`idx_item_prices_validity`). The index bounds the scan to the
 candidates for this item and tier; `EXPLAIN QUERY PLAN` still shows `USE TEMP B-TREE FOR ORDER BY`
 because the ordering key is `store_id IS NULL`, which no index stores. That sort is bounded by the
-number of open rows per scope (at most two: one store override and one default per tier), so the temp
-b-tree is over a handful of rows and is not worth an expression index. Measured plans:
-`docs/explain-queries.py`.
+number of open rows per scope and MRP variant, so the temp b-tree is over a handful of rows and is not
+worth an expression index. Measured plans: `docs/explain-queries.py`.
+
+With several MRP variants open (D27) the server adds `AND IFNULL(mrp_minor, -1) = IFNULL(?5, -1)`, where
+`?5` is the line's `mrp_minor`, so it prices the batch the cashier billed. The register's scan lookup
+lists every open variant instead of taking one:
+
+```sql
+SELECT p.price_minor, p.mrp_minor, p.version, p.store_id
+FROM item_prices p
+WHERE p.item_id = ?1 AND p.qty_base = ?2 AND p.valid_to IS NULL
+  AND (p.store_id IS ?3
+       OR (p.store_id IS NULL AND NOT EXISTS (
+             SELECT 1 FROM item_prices s
+             WHERE s.item_id = p.item_id AND s.store_id IS ?3 AND s.qty_base = p.qty_base
+               AND IFNULL(s.mrp_minor, -1) = IFNULL(p.mrp_minor, -1) AND s.valid_to IS NULL)))
+ORDER BY p.mrp_minor;
+```
+
+More than one row means the cashier picks. Plans on `uq_item_prices_open` and `idx_item_prices_validity`.
 
 ## 4. All tiers for an item (pricing decomposition runs in Go)
 

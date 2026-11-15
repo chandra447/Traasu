@@ -497,3 +497,29 @@ sees the size of the gap. Flags are for review; the bill is accepted as charged.
 Cost: every item edit must bump `version` (the trigger refuses one that does not), and the register must keep
 the version numbers it received. Item history is not stored as rows: the line's copies are the record of what
 an old version said.
+
+## D27. Multiple MRP: the cashier picks the price printed on the pack
+
+One item can be on the shelf in two batches with different printed MRPs: soap bought in April at MRP ₹100,
+bought again in May at MRP ₹200, both still for sale. Indian law does not allow charging more than the
+printed MRP, so the April pack cannot simply move to the new price.
+
+Each printed MRP is a **price variant** of the item, with its own tier set and its own price versions.
+Several variants can be open at once; the variant key is `IFNULL(mrp_minor, -1)`, so loose goods without an
+MRP are one variant.
+
+| Moment | What happens |
+|---|---|
+| Owner adds the May batch | `PUT /v1/admin/items/:id/prices` with `mrp_minor: 20000` opens a new variant. The April variant stays open. |
+| Cashier scans the soap | The register finds the open variants for that tier. One variant: it bills directly. Two or more: it shows each MRP and its selling price, and the cashier picks the one printed on the pack. No variant is preselected. |
+| Line is billed | The line records `mrp_minor` (new, 0008), `price_version` and `price_store_id`. The version names exactly one variant, so the server's stale check (D26) still works by key. The receipt prints the MRP. |
+| April stock sold out | The owner retires the MRP ₹100 variant in admin. It closes (`valid_to`) and the prompt stops on the next sync. |
+
+Store precedence is per variant: a store row for MRP ₹200 overrides the default row for MRP ₹200 only.
+
+Enforced in 0008: `uq_item_prices_open` now includes the MRP, and `trg_item_prices_version_scope` and
+`trg_item_prices_revision_coherent` work per variant. `check-invariants.py` runs the April/May soap case.
+
+Cost: retiring an old MRP is a manual owner action, because v1 has no stock ledger to tell when a batch is
+gone. An old variant left open keeps the prompt on the register; the admin item list shows how many
+variants are open.

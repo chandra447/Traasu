@@ -64,6 +64,13 @@ QUERIES = {
         "SELECT price_minor, version FROM item_prices WHERE item_id = ? AND qty_base = ? "
         "AND (store_id IS ? OR store_id IS NULL) AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) "
         "ORDER BY store_id IS NULL, valid_from DESC LIMIT 1"),
+    "MRP variants open for a tier (register, at scan)": (
+        "SELECT p.price_minor, p.mrp_minor, p.version, p.store_id FROM item_prices p "
+        "WHERE p.item_id = ? AND p.qty_base = ? AND p.valid_to IS NULL "
+        "AND (p.store_id IS ? OR (p.store_id IS NULL AND NOT EXISTS (SELECT 1 FROM item_prices s "
+        "WHERE s.item_id = p.item_id AND s.store_id IS ? AND s.qty_base = p.qty_base "
+        "AND IFNULL(s.mrp_minor, -1) = IFNULL(p.mrp_minor, -1) AND s.valid_to IS NULL))) "
+        "ORDER BY p.mrp_minor"),
     "day report (bill_lines)": (
         "SELECT bl.item_id, SUM(bl.qty_base), SUM(bl.line_total_minor) FROM bill_lines bl "
         "JOIN bills b ON b.id = bl.bill_id WHERE b.store_id = ? AND b.business_date = ? "

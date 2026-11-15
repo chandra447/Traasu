@@ -116,7 +116,7 @@ the admin web.
 | GET | `/v1/admin/items/:id` | session | item + scoped prices + identifiers | read | `{item, prices[], identifiers[], catalog_seq}` | `404 not_found`, `403 store_forbidden` |
 | PATCH | `/v1/admin/items/:id` | owner + CSRF | name, `name_local`, tax, HSN, MRP, flags, `active` | absolute values; optional `If-Match` | `{item, catalog:{epoch,head}}` | `404 not_found`, `409 immutable_field`, `409 edit_conflict`, `422 validation_failed` |
 | DELETE | `/v1/admin/items/:id` | owner + CSRF | soft delete; deactivates identifiers | yes (already inactive returns 200) | `{item_id, active:false, catalog:{epoch,head}}` | `404 not_found`, `403 forbidden_role` |
-| PUT | `/v1/admin/items/:id/prices` | owner + CSRF | replace one scope's tier set; new version | **no** — versioned; replay with old `base_version` is 409 | `{item_id, store_key, version, prices[], catalog:{epoch,head}}` | `404 not_found`, `409 version_conflict`, `422 validation_failed` |
+| PUT | `/v1/admin/items/:id/prices` | owner + CSRF | replace the tier set of one scope and one MRP variant (`store_key`, `mrp_minor`); new version. An empty `prices[]` retires that variant (D27) | **no** — versioned; replay with old `base_version` is 409 | `{item_id, store_key, mrp_minor, version, prices[], catalog:{epoch,head}}` | `404 not_found`, `409 version_conflict`, `422 validation_failed` |
 | PUT | `/v1/admin/items/:id/identifiers` | owner + CSRF | replace one store's identifier set | **yes** — same set is a no-op | `{item_id, store_id, identifiers[], catalog:{epoch,head}}` | `404 not_found`, `409 identifier_conflict`, `422 validation_failed` |
 | GET | `/v1/admin/items/:id/history` | session | price versions for the item | read | `{item_id, prices[], next_cursor, has_more}` | `404 not_found` |
 | GET | `/v1/admin/reports/sales-by-item` | session | per-item qty/amount for a date range | read | `{range, rows[], totals, provisional_until, next_cursor, has_more}` | `400 invalid_range`, `403 store_forbidden`, `413 range_too_large`, `429 rate_limited` |
@@ -232,6 +232,11 @@ above say 1,000 g sells for 4,000 and 500 g for 2,500. A bill line is different:
 `list_price_minor` are rates per `price_basis_qty_base` (D23), and its `price_breakdown.parts` copy the
 tier rows it used, so the parts sum to the line's `list_amount_minor`.
 
+**Multiple MRP (D27).** An item may have several open price variants, one per printed MRP (April soap at MRP
+₹100, May soap at MRP ₹200). At scan the register lists the open variants for the tier, with the store row
+winning per variant. One variant bills directly. Two or more show a picker with each MRP and selling
+price, and the cashier selects the MRP printed on the pack; nothing is preselected.
+
 Snapshot is paged, never one unbounded response:
 `GET /v1/catalog?snapshot=1&epoch=1&snapshot_page=items&snapshot_cursor=...&limit=500`.
 Pages cover `items`, `prices`, `identifiers`, `users`, `reference` (units/tax rates) and `store`
@@ -309,7 +314,7 @@ local_seq)` exists with another id → `duplicate_seq`.
  "created_at":1763107200,"payload_sha256":"b0e1...64hex",
  "lines":[{"line_no":1,"item_id":"0192f3c4-8a5b-7c3d-9e1f-2a3b4c5d6e7f",
   "item_name":"Tamarind","dimension":"mass","qty_base":1500,"item_version":3,
-  "price_version":8,"price_store_id":null,"price_source":"tier","approval_grant_id":null,
+  "price_version":8,"price_store_id":null,"mrp_minor":null,"price_source":"tier","approval_grant_id":null,
   "price_basis_qty_base":1000,"list_price_minor":4000,"price_minor":4000,
   "list_amount_minor":6500,"discount_minor":0,
   "price_breakdown":{"parts":[{"qty_base":1000,"price_minor":4000},
@@ -366,7 +371,7 @@ Money rules, enforced by the Worker and by the terminal's own triggers (D23):
   inclusive; a per-rate invoice summary is derived from the lines, never computed a second way.
 
 The register's local catalog is the source of truth for the sale (D26). Each line freezes `item_version`,
-`price_version` and `price_store_id` (`null` = franchise default) when it is added to the cart, with the
+`price_version`, `price_store_id` (`null` = franchise default) and `mrp_minor` (the MRP variant) when it is added to the cart, with the
 copied item fields and money. A catalog update that arrives while a cart is open never reprices lines
 already in it; only lines added afterwards use the new catalog. `item` change rows and documents carry
 `version`, and the register applies an item only when that version is not older than the one it holds.

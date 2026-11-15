@@ -178,6 +178,31 @@ expect("default v3 after closing every v1 tier", price(None, 1000, 3, 200, 4200)
        price(None, 500, 3, 200, 2600), "OK/OK")
 expect("older version inserted after a newer one", price("s2", 1000, 2, 300), "price_version_scope")
 
+# Multiple MRP (D27): soap bought in April at MRP 100 and in May at MRP 200, both on the shelf
+write("INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, updated_at) "
+      "VALUES ('soap', 'Soap', 'count', 'fixed_only', 'pcs', 'pcs', 0)")
+
+
+def soap(version, mrp, sell, valid_from):
+    return write("INSERT INTO item_prices (item_id, qty_base, version, price_minor, mrp_minor, valid_from, created_at) "
+                 "VALUES ('soap', 1, ?, ?, ?, ?, 0)", version, sell, mrp, valid_from)
+
+
+def open_variants():
+    return con.execute("SELECT mrp_minor, price_minor FROM item_prices WHERE item_id = 'soap' AND valid_to IS NULL "
+                       "ORDER BY mrp_minor").fetchall()
+
+
+expect("April batch: MRP 100", soap(1, 10000, 10000, 100), "OK")
+expect("May batch: MRP 200 while April is still open", soap(2, 20000, 20000, 200), "OK")
+expect("both variants open for the cashier", open_variants(), [(10000, 10000), (20000, 20000)])
+expect("second open price for the MRP 100 variant", soap(3, 10000, 9500, 300), "price_revision_mixed")
+write("UPDATE item_prices SET valid_to = 300 WHERE item_id = 'soap' AND mrp_minor = 10000 AND valid_to IS NULL")
+expect("reprice the MRP 100 variant to 95", soap(3, 10000, 9500, 300), "OK")
+expect("MRP 200 variant untouched", open_variants(), [(10000, 9500), (20000, 20000)])
+write("UPDATE item_prices SET valid_to = 400 WHERE item_id = 'soap' AND mrp_minor = 10000 AND valid_to IS NULL")
+expect("April stock sold out: retire MRP 100", open_variants(), [(20000, 20000)])
+
 expect("schema_version after all migrations", con.execute("SELECT schema_version FROM schema_meta").fetchone(),
        (len(list((here / "migrations").glob("*.sql"))) + 1,))
 

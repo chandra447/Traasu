@@ -237,27 +237,45 @@ BEGIN
   SELECT RAISE(ABORT, 'item_version_not_bumped');
 END;
 
--- Price version names one revision of one scope (schema review D17): versions
--- are per item across all scopes and only grow, so (item_id, version) plus
--- bill_lines.price_store_id identifies the exact tier set a line used.
+-- ---------------------------------------------------------------------------
+-- Multiple MRP (D27). The same item can be on the shelf in two batches with
+-- different printed MRPs (soap bought in April at MRP 100, in May at MRP 200).
+-- Each printed MRP is a price variant with its own tier set; several can be
+-- open at once and the cashier picks the one printed on the pack. A NULL MRP
+-- (loose goods) is one variant. The variant key is IFNULL(mrp_minor, -1).
+-- ---------------------------------------------------------------------------
+DROP INDEX IF EXISTS uq_item_prices_open;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_item_prices_open
+  ON item_prices(item_id, IFNULL(store_id, ''), qty_base, IFNULL(mrp_minor, -1))
+  WHERE valid_to IS NULL;
+
+-- The MRP printed on the pack the cashier billed; it goes on the receipt.
+ALTER TABLE bill_lines ADD COLUMN mrp_minor INTEGER CHECK (mrp_minor IS NULL OR mrp_minor >= 0);
+
+-- A price version names one revision of one scope and one MRP variant (schema
+-- review D17): versions are per item across all scopes and variants and only
+-- grow, so (item_id, price_version) identifies the exact tier set a line used.
 CREATE TRIGGER IF NOT EXISTS trg_item_prices_version_scope
 BEFORE INSERT ON item_prices
 WHEN EXISTS (SELECT 1 FROM item_prices p
              WHERE p.item_id = NEW.item_id
                AND (p.version > NEW.version
-                    OR (p.version = NEW.version AND IFNULL(p.store_id, '') <> IFNULL(NEW.store_id, ''))))
+                    OR (p.version = NEW.version
+                        AND (IFNULL(p.store_id, '') <> IFNULL(NEW.store_id, '')
+                             OR IFNULL(p.mrp_minor, -1) <> IFNULL(NEW.mrp_minor, -1)))))
 BEGIN
   SELECT RAISE(ABORT, 'price_version_scope');
 END;
 
--- No half-open revision (schema review D16): the writer closes every open row
--- of the scope, then inserts the whole new tier set at one version and one
--- valid_from. A partial write aborts instead of shipping mixed tiers.
+-- No half-open revision (schema review D16): within one scope and one MRP
+-- variant, the writer closes every open row, then inserts the whole new tier
+-- set at one version and one valid_from. Other variants stay open.
 CREATE TRIGGER IF NOT EXISTS trg_item_prices_revision_coherent
 BEFORE INSERT ON item_prices
 WHEN EXISTS (SELECT 1 FROM item_prices p
              WHERE p.item_id = NEW.item_id
                AND IFNULL(p.store_id, '') = IFNULL(NEW.store_id, '')
+               AND IFNULL(p.mrp_minor, -1) = IFNULL(NEW.mrp_minor, -1)
                AND p.valid_to IS NULL
                AND (p.version <> NEW.version OR p.valid_from <> NEW.valid_from))
 BEGIN
