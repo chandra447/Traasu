@@ -216,6 +216,8 @@ CREATE TABLE IF NOT EXISTS catalog_rebuild (
 -- Item document version: every admin edit bumps it; catalog_changes carries it.
 ALTER TABLE items ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0);
 ALTER TABLE bill_lines ADD COLUMN item_version INTEGER NOT NULL DEFAULT 1 CHECK (item_version > 0);
+-- 1 = the item is sold from batches (D27); 0 = one item-level price set (loose goods).
+ALTER TABLE items ADD COLUMN uses_batches INTEGER NOT NULL DEFAULT 0 CHECK (uses_batches IN (0, 1));
 
 -- A version never goes backwards, and the same version never means two
 -- documents. Equal version with equal content is allowed: that is a terminal
@@ -232,28 +234,79 @@ WHEN NEW.version < OLD.version
      OR NEW.allow_discount_pct IS NOT OLD.allow_discount_pct
      OR NEW.restrict_price_edit IS NOT OLD.restrict_price_edit
      OR NEW.prompt_qty IS NOT OLD.prompt_qty OR NEW.scale_qty IS NOT OLD.scale_qty
-     OR NEW.active IS NOT OLD.active))
+     OR NEW.active IS NOT OLD.active OR NEW.uses_batches IS NOT OLD.uses_batches))
 BEGIN
   SELECT RAISE(ABORT, 'item_version_not_bumped');
 END;
 
 -- ---------------------------------------------------------------------------
--- Multiple MRP (D27). The same item can be on the shelf in two batches with
--- different printed MRPs (soap bought in April at MRP 100, in May at MRP 200).
--- Each printed MRP is a price variant with its own tier set; several can be
--- open at once and the cashier picks the one printed on the pack. A NULL MRP
--- (loose goods) is one variant. The variant key is IFNULL(mrp_minor, -1).
+-- Batches (D27). Stock of one item arrives in batches: soap received in April
+-- at MRP 100 and in May at MRP 200 are two batches, both on the shelf. A batch
+-- belongs to one store (stock is physical), carries its MRP, an optional
+-- expiry, its own selling-price tier set, and a quantity kept as a ledger.
+-- Modelled on GoFrugal's batch-wise billing; see DECISIONS.md D27.
 -- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS item_batches (
+  id           TEXT PRIMARY KEY,
+  item_id      TEXT NOT NULL REFERENCES items(id) ON DELETE RESTRICT,
+  store_id     TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+  batch_no     TEXT NOT NULL CHECK (length(batch_no) BETWEEN 1 AND 40),
+  mrp_minor    INTEGER CHECK (mrp_minor IS NULL OR mrp_minor >= 0),
+  -- NULL = no expiry (most grocery). A past date makes the batch unsellable.
+  expiry_date  TEXT CHECK (expiry_date IS NULL
+                          OR expiry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  received_at  INTEGER NOT NULL,
+  retired_at   INTEGER,
+  version      INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+  created_by   TEXT REFERENCES users(id) ON DELETE RESTRICT,
+  updated_at   INTEGER NOT NULL
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_item_batches_no ON item_batches(store_id, item_id, batch_no);
+CREATE INDEX IF NOT EXISTS idx_item_batches_live
+  ON item_batches(item_id, store_id, received_at) WHERE retired_at IS NULL;
+
+-- Same versioning rule as items (D26): a change bumps the version; an equal
+-- version is only a replay. Batches are retired, never deleted: bill lines name them.
+CREATE TRIGGER IF NOT EXISTS trg_item_batches_version
+BEFORE UPDATE ON item_batches
+WHEN NEW.version < OLD.version
+  OR (NEW.version = OLD.version AND (
+        NEW.batch_no IS NOT OLD.batch_no OR NEW.mrp_minor IS NOT OLD.mrp_minor
+     OR NEW.expiry_date IS NOT OLD.expiry_date OR NEW.retired_at IS NOT OLD.retired_at
+     OR NEW.item_id IS NOT OLD.item_id OR NEW.store_id IS NOT OLD.store_id))
+BEGIN
+  SELECT RAISE(ABORT, 'batch_version_not_bumped');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_item_batches_no_delete
+BEFORE DELETE ON item_batches
+BEGIN
+  SELECT RAISE(ABORT, 'batch_retire_only');
+END;
+
+-- A batch's selling prices are item_prices rows tagged with the batch, in the
+-- batch's store. batch_id NULL = the item-level price set, as before.
+ALTER TABLE item_prices ADD COLUMN batch_id TEXT;
+
+CREATE TRIGGER IF NOT EXISTS trg_item_prices_batch_scope
+BEFORE INSERT ON item_prices
+WHEN NEW.batch_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM item_batches b
+  WHERE b.id = NEW.batch_id AND b.item_id = NEW.item_id AND b.store_id IS NEW.store_id)
+BEGIN
+  SELECT RAISE(ABORT, 'batch_price_scope');
+END;
+
+-- Several batches can have open prices at once; within one batch, one open
+-- price per tier.
 DROP INDEX IF EXISTS uq_item_prices_open;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_item_prices_open
-  ON item_prices(item_id, IFNULL(store_id, ''), qty_base, IFNULL(mrp_minor, -1))
+  ON item_prices(item_id, IFNULL(store_id, ''), qty_base, IFNULL(batch_id, ''))
   WHERE valid_to IS NULL;
 
--- The MRP printed on the pack the cashier billed; it goes on the receipt.
-ALTER TABLE bill_lines ADD COLUMN mrp_minor INTEGER CHECK (mrp_minor IS NULL OR mrp_minor >= 0);
-
--- A price version names one revision of one scope and one MRP variant (schema
--- review D17): versions are per item across all scopes and variants and only
+-- A price version names one revision of one scope and one batch (schema
+-- review D17): versions are per item across all scopes and batches and only
 -- grow, so (item_id, price_version) identifies the exact tier set a line used.
 CREATE TRIGGER IF NOT EXISTS trg_item_prices_version_scope
 BEFORE INSERT ON item_prices
@@ -262,24 +315,96 @@ WHEN EXISTS (SELECT 1 FROM item_prices p
                AND (p.version > NEW.version
                     OR (p.version = NEW.version
                         AND (IFNULL(p.store_id, '') <> IFNULL(NEW.store_id, '')
-                             OR IFNULL(p.mrp_minor, -1) <> IFNULL(NEW.mrp_minor, -1)))))
+                             OR IFNULL(p.batch_id, '') <> IFNULL(NEW.batch_id, '')))))
 BEGIN
   SELECT RAISE(ABORT, 'price_version_scope');
 END;
 
--- No half-open revision (schema review D16): within one scope and one MRP
--- variant, the writer closes every open row, then inserts the whole new tier
--- set at one version and one valid_from. Other variants stay open.
+-- No half-open revision (schema review D16): within one scope and one batch,
+-- the writer closes every open row, then inserts the whole new tier set at one
+-- version and one valid_from. Other batches stay open.
 CREATE TRIGGER IF NOT EXISTS trg_item_prices_revision_coherent
 BEFORE INSERT ON item_prices
 WHEN EXISTS (SELECT 1 FROM item_prices p
              WHERE p.item_id = NEW.item_id
                AND IFNULL(p.store_id, '') = IFNULL(NEW.store_id, '')
-               AND IFNULL(p.mrp_minor, -1) = IFNULL(NEW.mrp_minor, -1)
+               AND IFNULL(p.batch_id, '') = IFNULL(NEW.batch_id, '')
                AND p.valid_to IS NULL
                AND (p.version <> NEW.version OR p.valid_from <> NEW.valid_from))
 BEGIN
   SELECT RAISE(ABORT, 'price_revision_mixed');
+END;
+
+-- What the cashier billed, copied onto the immutable line. batch_id is plain
+-- TEXT, not an FK: an unknown batch is flagged by the Worker, never rejected.
+ALTER TABLE bill_lines ADD COLUMN batch_id TEXT;
+ALTER TABLE bill_lines ADD COLUMN batch_no TEXT;
+ALTER TABLE bill_lines ADD COLUMN mrp_minor INTEGER CHECK (mrp_minor IS NULL OR mrp_minor >= 0);
+
+-- ---------------------------------------------------------------------------
+-- Batch quantity. inventory_movements is the ledger: receipt and adjustment
+-- rows come from admin, sale rows from bills, void rows from voids. batch_stock
+-- is the running balance, kept by trigger; it may go negative, because a
+-- register sells offline and v1 never blocks a sale on stock.
+-- ---------------------------------------------------------------------------
+ALTER TABLE inventory_movements ADD COLUMN batch_id TEXT;
+ALTER TABLE inventory_movements ADD COLUMN store_id TEXT;
+ALTER TABLE inventory_movements ADD COLUMN reason TEXT NOT NULL DEFAULT 'sale'
+  CHECK (reason IN ('receipt', 'adjustment', 'sale', 'void'));
+ALTER TABLE inventory_movements ADD COLUMN note TEXT;
+ALTER TABLE inventory_movements ADD COLUMN created_by TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_inventory_movements_batch
+  ON inventory_movements(batch_id, occurred_at) WHERE batch_id IS NOT NULL;
+
+-- Stock cursor for GET /v1/stock: one allocator, so commit order is seq order
+-- (the same argument as catalog_seq, D1). Kept out of catalog_changes, which
+-- would otherwise gain a row for every line of every sale.
+CREATE TABLE IF NOT EXISTS stock_seq (
+  id        INTEGER PRIMARY KEY CHECK (id = 1),
+  last_seq  INTEGER NOT NULL CHECK (last_seq >= 0)
+) STRICT;
+INSERT OR IGNORE INTO stock_seq (id, last_seq) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS batch_stock (
+  batch_id          TEXT PRIMARY KEY REFERENCES item_batches(id) ON DELETE RESTRICT,
+  store_id          TEXT NOT NULL,
+  on_hand_qty_base  INTEGER NOT NULL,
+  seq               INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_batch_stock_store_seq ON batch_stock(store_id, seq);
+
+-- The balance moves on INSERT only. Archival deletes old sale movements by
+-- cascade and must not change what is on the shelf.
+CREATE TRIGGER IF NOT EXISTS trg_movements_batch_stock
+AFTER INSERT ON inventory_movements
+WHEN NEW.batch_id IS NOT NULL AND EXISTS (SELECT 1 FROM item_batches WHERE id = NEW.batch_id)
+BEGIN
+  UPDATE stock_seq SET last_seq = last_seq + 1 WHERE id = 1;
+  INSERT INTO batch_stock (batch_id, store_id, on_hand_qty_base, seq, updated_at)
+  SELECT b.id, b.store_id,
+         CASE NEW.direction WHEN 'in' THEN NEW.qty_base ELSE -NEW.qty_base END,
+         (SELECT last_seq FROM stock_seq WHERE id = 1), NEW.created_at
+  FROM item_batches b WHERE b.id = NEW.batch_id
+  ON CONFLICT (batch_id) DO UPDATE SET
+    on_hand_qty_base = on_hand_qty_base + excluded.on_hand_qty_base,
+    seq              = excluded.seq,
+    updated_at       = excluded.updated_at;
+END;
+
+-- A void puts the goods back: one 'in' movement per sale movement of the bill.
+-- The id is derived from the void and the line, so it is deterministic.
+CREATE TRIGGER IF NOT EXISTS trg_bill_voids_restock
+AFTER INSERT ON bill_voids
+BEGIN
+  INSERT INTO inventory_movements (id, item_id, bill_id, bill_line_no, direction, qty_base, occurred_at,
+                                   created_at, batch_id, store_id, reason, created_by)
+  SELECT NEW.id || ':' || m.bill_line_no, m.item_id, m.bill_id, m.bill_line_no, 'in', m.qty_base,
+         NEW.created_at, NEW.created_at, m.batch_id, m.store_id, 'void', NEW.user_id
+  FROM inventory_movements m
+  WHERE m.bill_id = NEW.bill_id AND m.reason = 'sale';
 END;
 
 UPDATE schema_meta SET schema_version = 8 WHERE id = 1;

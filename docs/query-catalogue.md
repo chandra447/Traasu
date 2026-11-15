@@ -63,23 +63,37 @@ because the ordering key is `store_id IS NULL`, which no index stores. That sort
 number of open rows per scope and MRP variant, so the temp b-tree is over a handful of rows and is not
 worth an expression index. Measured plans: `docs/explain-queries.py`.
 
-With several MRP variants open (D27) the server adds `AND IFNULL(mrp_minor, -1) = IFNULL(?5, -1)`, where
-`?5` is the line's `mrp_minor`, so it prices the batch the cashier billed. The register's scan lookup
-lists every open variant instead of taking one:
+For a batched item (D27) the server adds `AND batch_id IS ?5`, where `?5` is the line's `batch_id`, so
+it prices the batch the cashier billed. The register's scan lookup lists the batches to offer instead of
+taking one price:
 
 ```sql
-SELECT p.price_minor, p.mrp_minor, p.version, p.store_id
-FROM item_prices p
-WHERE p.item_id = ?1 AND p.qty_base = ?2 AND p.valid_to IS NULL
-  AND (p.store_id IS ?3
-       OR (p.store_id IS NULL AND NOT EXISTS (
-             SELECT 1 FROM item_prices s
-             WHERE s.item_id = p.item_id AND s.store_id IS ?3 AND s.qty_base = p.qty_base
-               AND IFNULL(s.mrp_minor, -1) = IFNULL(p.mrp_minor, -1) AND s.valid_to IS NULL)))
-ORDER BY p.mrp_minor;
+-- ?1 item, ?2 store, ?3 business date
+WITH live AS (
+  SELECT b.id, b.batch_no, b.mrp_minor, b.expiry_date, b.received_at,
+         IFNULL(s.on_hand_qty_base, 0) AS on_hand
+  FROM item_batches b LEFT JOIN batch_stock s ON s.batch_id = b.id
+  WHERE b.item_id = ?1 AND b.store_id = ?2 AND b.retired_at IS NULL
+    AND (b.expiry_date IS NULL OR b.expiry_date >= ?3))
+SELECT * FROM live
+WHERE on_hand > 0
+   OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1)   -- newest always shows
+ORDER BY received_at DESC, id DESC;
 ```
 
-More than one row means the cashier picks. Plans on `uq_item_prices_open` and `idx_item_prices_validity`.
+More than one row means the cashier picks; the picked batch's prices are
+`SELECT ... FROM item_prices WHERE item_id = ?1 AND batch_id = ?4 AND valid_to IS NULL`. Plans on
+`idx_item_batches_live`, the `batch_stock` primary key and `uq_item_prices_open`.
+
+Stock pull (`GET /v1/stock?since=`), store-scoped, by the `stock_seq` cursor:
+
+```sql
+SELECT batch_id, on_hand_qty_base, seq FROM batch_stock
+WHERE store_id = ?1 AND seq > ?2 ORDER BY seq LIMIT 500;
+```
+
+Seeks `idx_batch_stock_store_seq`. The register stores `on_hand = server value − its unsynced sales of
+that batch`, so its own pending sales are not counted twice.
 
 ## 4. All tiers for an item (pricing decomposition runs in Go)
 

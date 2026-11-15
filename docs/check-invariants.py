@@ -178,30 +178,79 @@ expect("default v3 after closing every v1 tier", price(None, 1000, 3, 200, 4200)
        price(None, 500, 3, 200, 2600), "OK/OK")
 expect("older version inserted after a newer one", price("s2", 1000, 2, 300), "price_version_scope")
 
-# Multiple MRP (D27): soap bought in April at MRP 100 and in May at MRP 200, both on the shelf
-write("INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, updated_at) "
-      "VALUES ('soap', 'Soap', 'count', 'fixed_only', 'pcs', 'pcs', 0)")
+# Batches (D27): soap received in April at MRP 100 and in May at MRP 200, both on the shelf in store s1
+write("INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, uses_batches, updated_at) "
+      "VALUES ('soap', 'Soap', 'count', 'fixed_only', 'pcs', 'pcs', 1, 0)")
 
 
-def soap(version, mrp, sell, valid_from):
-    return write("INSERT INTO item_prices (item_id, qty_base, version, price_minor, mrp_minor, valid_from, created_at) "
-                 "VALUES ('soap', 1, ?, ?, ?, ?, 0)", version, sell, mrp, valid_from)
+def batch(bid, no, mrp, received_at, expiry=None, store="s1"):
+    return write("INSERT INTO item_batches (id, item_id, store_id, batch_no, mrp_minor, expiry_date, received_at, "
+                 "updated_at) VALUES (?, 'soap', ?, ?, ?, ?, ?, 0)", bid, store, no, mrp, expiry, received_at)
 
 
-def open_variants():
-    return con.execute("SELECT mrp_minor, price_minor FROM item_prices WHERE item_id = 'soap' AND valid_to IS NULL "
-                       "ORDER BY mrp_minor").fetchall()
+def move(mid, bid, direction, qty, reason, bill=None, line_no=None):
+    return write("INSERT INTO inventory_movements (id, item_id, bill_id, bill_line_no, direction, qty_base, occurred_at, "
+                 "created_at, batch_id, store_id, reason) VALUES (?, 'soap', ?, ?, ?, ?, 0, 0, ?, 's1', ?)",
+                 mid, bill, line_no, direction, qty, bid, reason)
 
 
-expect("April batch: MRP 100", soap(1, 10000, 10000, 100), "OK")
-expect("May batch: MRP 200 while April is still open", soap(2, 20000, 20000, 200), "OK")
-expect("both variants open for the cashier", open_variants(), [(10000, 10000), (20000, 20000)])
-expect("second open price for the MRP 100 variant", soap(3, 10000, 9500, 300), "price_revision_mixed")
-write("UPDATE item_prices SET valid_to = 300 WHERE item_id = 'soap' AND mrp_minor = 10000 AND valid_to IS NULL")
-expect("reprice the MRP 100 variant to 95", soap(3, 10000, 9500, 300), "OK")
-expect("MRP 200 variant untouched", open_variants(), [(10000, 9500), (20000, 20000)])
-write("UPDATE item_prices SET valid_to = 400 WHERE item_id = 'soap' AND mrp_minor = 10000 AND valid_to IS NULL")
-expect("April stock sold out: retire MRP 100", open_variants(), [(20000, 20000)])
+def on_hand(bid):
+    return con.execute("SELECT on_hand_qty_base FROM batch_stock WHERE batch_id = ?", (bid,)).fetchone()[0]
+
+
+PICKER = """
+WITH live AS (
+  SELECT b.id, b.received_at, IFNULL(s.on_hand_qty_base, 0) AS on_hand
+  FROM item_batches b LEFT JOIN batch_stock s ON s.batch_id = b.id
+  WHERE b.item_id = ?1 AND b.store_id = ?2 AND b.retired_at IS NULL
+    AND (b.expiry_date IS NULL OR b.expiry_date >= ?3))
+SELECT id FROM live
+WHERE on_hand > 0 OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1)
+ORDER BY received_at DESC, id DESC
+"""
+
+
+def picker(day="2026-11-14"):
+    return [r[0] for r in con.execute(PICKER, ("soap", "s1", day))]
+
+
+expect("April batch, no expiry", batch("b_apr", "APR-24", 10000, 100), "OK")
+expect("May batch, no expiry", batch("b_may", "MAY-24", 20000, 200), "OK")
+expect("old batch that expired", batch("b_old", "JAN-24", 9000, 50, expiry="2026-01-01"), "OK")
+expect("receive 10 / 24 / 5", "/".join([move("r1", "b_apr", "in", 10, "receipt"), move("r2", "b_may", "in", 24, "receipt"),
+                                         move("r3", "b_old", "in", 5, "receipt")]), "OK/OK/OK")
+expect("April price in its own store", write(
+    "INSERT INTO item_prices (item_id, store_id, batch_id, qty_base, version, price_minor, mrp_minor, valid_from, "
+    "created_at) VALUES ('soap', 's1', 'b_apr', 1, 1, 10000, 10000, 100, 0)"), "OK")
+expect("May price open at the same time", write(
+    "INSERT INTO item_prices (item_id, store_id, batch_id, qty_base, version, price_minor, mrp_minor, valid_from, "
+    "created_at) VALUES ('soap', 's1', 'b_may', 1, 2, 20000, 20000, 200, 0)"), "OK")
+expect("batch price in another store", write(
+    "INSERT INTO item_prices (item_id, store_id, batch_id, qty_base, version, price_minor, valid_from, created_at) "
+    "VALUES ('soap', 's2', 'b_may', 1, 3, 20000, 200, 0)"), "batch_price_scope")
+expect("picker: both stocked batches, newest first, expired hidden", picker(), ["b_may", "b_apr"])
+expect("sell all 10 of April", move("s1m", "b_apr", "out", 10, "sale"), "OK")
+expect("April on hand", on_hand("b_apr"), 0)
+expect("picker: April out of stock, only May", picker(), ["b_may"])
+expect("May sold out too (stock count)", move("a1", "b_may", "out", 24, "adjustment"), "OK")
+expect("picker: the newest batch always shows", picker(), ["b_may"])
+expect("sell past zero offline", move("s2m", "b_may", "out", 2, "sale") + "/" + str(on_hand("b_may")), "OK/-2")
+expect("April restocked: shows again", move("r4", "b_apr", "in", 6, "receipt") + "/" + ",".join(picker()),
+       "OK/b_may,b_apr")
+expect("void puts the goods back", push("bsoap", [line(1, item="soap")]) + "/" +
+       move("s3m", "b_apr", "out", 1, "sale", bill="bsoap", line_no=1) + "/" + str(on_hand("b_apr")) + "/" +
+       write("INSERT INTO bill_voids (id, bill_id, store_id, terminal_id, user_id, reason, created_at) "
+             "VALUES ('vsoap', 'bsoap', 's1', 't1', 'u1', 'wrong pack', 4000)") + "/" + str(on_hand("b_apr")),
+       "OK/OK/5/OK/6")
+expect("batch edit without a version bump", write("UPDATE item_batches SET expiry_date = '2027-01-01' "
+                                                  "WHERE id = 'b_may'"), "batch_version_not_bumped")
+expect("batch edit with a version bump", write("UPDATE item_batches SET expiry_date = '2027-01-01', version = 2 "
+                                               "WHERE id = 'b_may'"), "OK")
+expect("picker after May expires", picker("2027-02-01"), ["b_apr"])
+expect("delete a batch", write("DELETE FROM item_batches WHERE id = 'b_apr'"), "batch_retire_only")
+expect("archival does not change stock", write("UPDATE schema_meta SET archive_before = '2026-12-01'") + "/" +
+       write("DELETE FROM bill_voids WHERE bill_id = 'bsoap'") + "/" + write("DELETE FROM bills WHERE id = 'bsoap'") +
+       "/" + str(on_hand("b_apr")), "OK/OK/OK/6")
 
 expect("schema_version after all migrations", con.execute("SELECT schema_version FROM schema_meta").fetchone(),
        (len(list((here / "migrations").glob("*.sql"))) + 1,))

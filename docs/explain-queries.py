@@ -64,13 +64,20 @@ QUERIES = {
         "SELECT price_minor, version FROM item_prices WHERE item_id = ? AND qty_base = ? "
         "AND (store_id IS ? OR store_id IS NULL) AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?) "
         "ORDER BY store_id IS NULL, valid_from DESC LIMIT 1"),
-    "MRP variants open for a tier (register, at scan)": (
-        "SELECT p.price_minor, p.mrp_minor, p.version, p.store_id FROM item_prices p "
-        "WHERE p.item_id = ? AND p.qty_base = ? AND p.valid_to IS NULL "
-        "AND (p.store_id IS ? OR (p.store_id IS NULL AND NOT EXISTS (SELECT 1 FROM item_prices s "
-        "WHERE s.item_id = p.item_id AND s.store_id IS ? AND s.qty_base = p.qty_base "
-        "AND IFNULL(s.mrp_minor, -1) = IFNULL(p.mrp_minor, -1) AND s.valid_to IS NULL))) "
-        "ORDER BY p.mrp_minor"),
+    "batch picker (register, at scan)": (
+        "WITH live AS (SELECT b.id, b.batch_no, b.mrp_minor, b.expiry_date, b.received_at, "
+        "IFNULL(s.on_hand_qty_base, 0) AS on_hand FROM item_batches b "
+        "LEFT JOIN batch_stock s ON s.batch_id = b.id WHERE b.item_id = ? AND b.store_id = ? "
+        "AND b.retired_at IS NULL AND (b.expiry_date IS NULL OR b.expiry_date >= ?)) "
+        "SELECT * FROM live WHERE on_hand > 0 "
+        "OR id = (SELECT id FROM live ORDER BY received_at DESC, id DESC LIMIT 1) "
+        "ORDER BY received_at DESC, id DESC"),
+    "batch prices (register, after pick)": (
+        "SELECT qty_base, price_minor, mrp_minor, version FROM item_prices "
+        "WHERE item_id = ? AND batch_id = ? AND valid_to IS NULL ORDER BY qty_base"),
+    "stock pull (GET /v1/stock)": (
+        "SELECT batch_id, on_hand_qty_base, seq FROM batch_stock WHERE store_id = ? AND seq > ? "
+        "ORDER BY seq LIMIT 500"),
     "day report (bill_lines)": (
         "SELECT bl.item_id, SUM(bl.qty_base), SUM(bl.line_total_minor) FROM bill_lines bl "
         "JOIN bills b ON b.id = bl.bill_id WHERE b.store_id = ? AND b.business_date = ? "

@@ -498,28 +498,73 @@ Cost: every item edit must bump `version` (the trigger refuses one that does not
 the version numbers it received. Item history is not stored as rows: the line's copies are the record of what
 an old version said.
 
-## D27. Multiple MRP: the cashier picks the price printed on the pack
+## D27. Batches: each receipt of stock is a batch with its own MRP, price, quantity and optional expiry
 
-One item can be on the shelf in two batches with different printed MRPs: soap bought in April at MRP ₹100,
-bought again in May at MRP ₹200, both still for sale. Indian law does not allow charging more than the
-printed MRP, so the April pack cannot simply move to the new price.
+Stock of one item arrives in batches. Soap received in April at MRP ₹100 and in May at MRP ₹200 are two
+batches, both on the shelf. Indian law forbids charging above the printed MRP, so the April pack cannot move
+to the May price. This replaces the earlier "MRP variant" draft of D27, and it moves batch tracking (without
+serial numbers) into v1. Stock is now tracked per batch but still never blocks a sale.
 
-Each printed MRP is a **price variant** of the item, with its own tier set and its own price versions.
-Several variants can be open at once; the variant key is `IFNULL(mrp_minor, -1)`, so loose goods without an
-MRP are one variant.
+### How GoFrugal does it, and what we take
 
-| Moment | What happens |
+| GoFrugal | Source | Here |
+|---|---|---|
+| A purchase or opening-stock entry with different price details creates a batch | [Sales – Batch LOV](https://help.serveeasy.gofrugal.com/Sales-Batch-LOV.html) | Admin "receive stock" creates a batch (no purchase module in v1) |
+| Batch has number, MRP, selling price, quantity, expiry; expiry optional or mandatory per item | [Batch and Expiry](https://community.gofrugal.com/portal/en/kb/gofrugalretaileasy/inventory-management/physical-inventory/articles/batch-and-expiry) | Same; expiry is optional (`NULL` = never expires) |
+| At billing a batch popup lists batches; the cashier selects; price follows the batch | Batch LOV | Same, with the visibility rule below |
+| Expired batches are struck out and cannot be sold | Batch and Expiry | Same |
+| Batch list sorted FIFO or short-expiry first | [Batch sorting](https://community.gofrugal.com/portal/en/kb/gofrugalmanageeasy/inventory-management/customer-category-wise-sales-bill/articles/batch-sorting-6-8-2020) | Newest first (owner's requirement); FIFO/short-expiry can be a store setting later |
+| "Change Selling" edits price and MRP batch-wise after inward | [Change Selling](https://community.gofrugal.com/portal/en/kb/gofrugalretaileasyoncloud/inventorymanagement/change-selling/articles/change-selling-28-10-2025) | Edit a batch's prices (new price version) or its MRP/expiry (new batch version) |
+| Cost price, supplier, purchase invoice | Batch and Expiry | Not stored: purchases stay a v1 non-goal |
+
+### Data
+
+| Table / column | Holds |
 |---|---|
-| Owner adds the May batch | `PUT /v1/admin/items/:id/prices` with `mrp_minor: 20000` opens a new variant. The April variant stays open. |
-| Cashier scans the soap | The register finds the open variants for that tier. One variant: it bills directly. Two or more: it shows each MRP and its selling price, and the cashier picks the one printed on the pack. No variant is preselected. |
-| Line is billed | The line records `mrp_minor` (new, 0008), `price_version` and `price_store_id`. The version names exactly one variant, so the server's stale check (D26) still works by key. The receipt prints the MRP. |
-| April stock sold out | The owner retires the MRP ₹100 variant in admin. It closes (`valid_to`) and the prompt stops on the next sync. |
+| `items.uses_batches` | 1 = sold from batches; 0 = one item-level price set (loose rice) |
+| `item_batches` | `store_id`, `batch_no`, `mrp_minor`, `expiry_date` (nullable), `received_at`, `retired_at`, `version` |
+| `item_prices.batch_id` | a batch's own selling-price tier set, in the batch's store |
+| `inventory_movements` + `batch_id`, `store_id`, `reason` | the ledger: `receipt`, `adjustment`, `sale`, `void` |
+| `batch_stock` | running on-hand per batch, kept by trigger; may go negative |
+| `bill_lines.batch_id`, `batch_no`, `mrp_minor` | the batch billed, copied onto the immutable line |
 
-Store precedence is per variant: a store row for MRP ₹200 overrides the default row for MRP ₹200 only.
+### What the cashier sees
 
-Enforced in 0008: `uq_item_prices_open` now includes the MRP, and `trg_item_prices_version_scope` and
-`trg_item_prices_revision_coherent` work per variant. `check-invariants.py` runs the April/May soap case.
+For an item with `uses_batches = 1`, the register lists the store's batches that are not retired and not
+expired, and shows:
 
-Cost: retiring an old MRP is a manual owner action, because v1 has no stock ledger to tell when a batch is
-gone. An old variant left open keeps the prompt on the register; the admin item list shows how many
-variants are open.
+- every batch with stock on hand above zero, **and**
+- the newest batch always, even at zero or below.
+
+Newest first. One batch listed: it bills directly, no prompt. Two or more: the cashier picks the batch whose
+MRP is printed on the pack; nothing is preselected. So when the April batch sells out, the cashier only sees
+May. Expired batches show struck out and cannot be picked.
+
+### Quantity across registers
+
+- **The server is the stock truth.** Receipts and adjustments come from admin. Each pushed sale line writes
+  a `sale` movement, and each void writes a `void` movement back.
+- **Registers pull on-hand by cursor.** `GET /v1/stock?since=` returns rows changed after `stock_seq`. This
+  is kept out of `catalog_changes`, which would otherwise gain a row per line of every sale.
+- **The register shows its own estimate.** Local `batch_stock` = server value minus this register's unsynced
+  sales. Other registers' sales appear on the next pull.
+- **Never a block.** Two offline registers can both sell the "last" packs, so `on_hand` can go negative. v1
+  never blocks a sale on stock; the owner fixes the count with an adjustment.
+
+### Updating a batch
+
+| Change | How |
+|---|---|
+| Selling price | New price version for that batch (D26 rules, per batch) |
+| MRP, batch number, expiry | Batch update with `version + 1` (`trg_item_batches_version`) |
+| Quantity | Never overwritten: an `adjustment` movement with a reason. A stock count enters the counted number; the Worker writes the difference. |
+| Stop selling it | Retire (`retired_at`). Batches are never deleted (`trg_item_batches_no_delete`). |
+
+Enforced in 0008 and covered by `check-invariants.py` (the April/May soap case end to end).
+
+Cost:
+- Every sold line on a batched item writes about two more rows (`batch_stock` upsert and the `stock_seq` bump)
+  on top of the movement.
+- `inventory_movements` stops being optional, so the ~25% saving from dropping it (D18) is gone for batched items.
+- Archival deletes old sale movements by cascade; `batch_stock` keeps the balance and the R2 export keeps the
+  history, so on-hand cannot be rebuilt from D1 alone after archival.

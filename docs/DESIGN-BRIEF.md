@@ -91,8 +91,9 @@ stores per enterprise.
 
 ## Non-goals for v1
 
-Purchases, suppliers, stock ledger enforcement, transfers, loyalty, customers/credit, tenders/payments,
-returns/refunds UI, batch/serial tracking, report builder, e-invoice.
+Purchases, suppliers, stock ledger *enforcement* (stock is tracked per batch, D27, but never blocks a
+sale), transfers, loyalty, customers/credit, tenders/payments, returns/refunds UI, serial tracking, report
+builder, e-invoice. Batch tracking (MRP, price, quantity, optional expiry) is in v1 (D27).
 
 ## Prior evidence
 

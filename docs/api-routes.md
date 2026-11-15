@@ -73,6 +73,7 @@ the call is `403 store_forbidden`. Every admin write takes an explicit field all
 | POST | `/v1/enroll` | one-time code + `install_id` (no JWT) | bind a device to store+terminal as **pending**, return the device credential | **no** — single-use code; lost response needs a new code | `{device_credential, device_id, status:"pending", tenant_id, app_id, store_id, terminal_id, store_name, server_time}` | `400 invalid_request`, `404 code_not_found`, `409 code_used`, `409 wrong_tenant`, `409 wrong_app`, `410 code_expired`, `421 unknown_host`, `429 rate_limited` |
 | POST | `/v1/token` | device credential + `install_id` | exchange an approved device credential for a 5 min JWT; refresh lease | safe to repeat; each call mints a new `jti` | `{access_token, token_type:"Bearer", expires_in:300, expires_at, lease_expires_at, server_time, tenant_id, app_id, store_id, terminal_id, catalog:{epoch,head,alloc_head,pruned_below,reset_to}, rotate_to}` | `401 invalid_credential`, `401 device_moved`, `401 device_revoked`, `401 wrong_tenant`, `401 wrong_app`, `403 approval_pending`, `426 upgrade_required`, `429 rate_limited` |
 | GET | `/v1/catalog` | device JWT | store-scoped catalog delta, or a paged snapshot after a reset | read; `since` + `epoch` make it replayable | delta `{mode, cursor_format, epoch, store_id, terminal_id, since, cursor, max_seen_seq, head, alloc_head, pruned_below, reset_to, has_more, server_time, changes[]}`; snapshot `{mode, snapshot_attempt_id, snapshot_page, snapshot_cursor, snapshot_complete, epoch, store_id, terminal_id, head, pruned_below, server_time, rows[]}` | `400 invalid_cursor`, `400 invalid_limit`, `400 cursor_format_unsupported`, `400 invalid_snapshot_page`, `410 stale_cursor`, `401 token_expired`, `429 rate_limited` |
+| GET | `/v1/stock` | device JWT | store-scoped batch on-hand changed after `since` (D27) | read; `since` + `epoch` make it replayable | `{epoch, store_id, since, cursor, has_more, server_time, rows:[{batch_id, on_hand_qty_base, seq}]}` | `400 invalid_cursor`, `410 stale_cursor` (epoch changed: full stock refresh), `401 token_expired`, `429 rate_limited` |
 | POST | `/v1/bills` | device JWT | push completed bills, voids, staff sessions and shifts; per-bill accept/reject | **yes** on bill and void `id`; duplicate returns accepted; different content is `id_conflict` | `{server_time, accepted:[{id,invoice_no,duplicate}], rejected:[{id,code,message}], voids:[{id,duplicate}], staff_sessions:[{id,duplicate}], shifts:[{id,duplicate}], flagged:{stale_price,price_mismatch,policy_violation,staff_inactive,unverified_staff,shift_unverified}, catalog:{epoch,head}}` | envelope: `400 invalid_request`, `413 batch_too_large`; per bill and per void: `invalid_bill`, `id_conflict`, `duplicate_seq`, `display_no_conflict`, `invalid_totals`, `bill_not_found`, `bill_archived`; always 200 if the envelope is valid |
 | POST | `/v1/bills/:id/void` | device JWT | append one `bill_voids` row; a trigger flips the bill's voided flag and decrements `sales_daily`; the bill stays immutable | **yes** — first void wins, later calls return the existing record | `{bill_id, voided:true, voided_at, voided_by, duplicate, server_time}` | `401 token_expired`, `403 store_forbidden`, `404 bill_not_found`, `409 bill_archived`, `422 invalid_reason`, `429 rate_limited` |
 | POST | `/v1/terminals/heartbeat` | device JWT | last-seen, app version, unsynced depth, lease refresh | upsert by device | `{server_time, min_terminal_version, latest_terminal_version, update_required, lease_expires_at, catalog:{epoch,head,alloc_head,pruned_below,reset_to}}` | `401 token_expired`, `426 upgrade_required`, `429 rate_limited` |
@@ -116,9 +117,13 @@ the admin web.
 | GET | `/v1/admin/items/:id` | session | item + scoped prices + identifiers | read | `{item, prices[], identifiers[], catalog_seq}` | `404 not_found`, `403 store_forbidden` |
 | PATCH | `/v1/admin/items/:id` | owner + CSRF | name, `name_local`, tax, HSN, MRP, flags, `active` | absolute values; optional `If-Match` | `{item, catalog:{epoch,head}}` | `404 not_found`, `409 immutable_field`, `409 edit_conflict`, `422 validation_failed` |
 | DELETE | `/v1/admin/items/:id` | owner + CSRF | soft delete; deactivates identifiers | yes (already inactive returns 200) | `{item_id, active:false, catalog:{epoch,head}}` | `404 not_found`, `403 forbidden_role` |
-| PUT | `/v1/admin/items/:id/prices` | owner + CSRF | replace the tier set of one scope and one MRP variant (`store_key`, `mrp_minor`); new version. An empty `prices[]` retires that variant (D27) | **no** — versioned; replay with old `base_version` is 409 | `{item_id, store_key, mrp_minor, version, prices[], catalog:{epoch,head}}` | `404 not_found`, `409 version_conflict`, `422 validation_failed` |
+| PUT | `/v1/admin/items/:id/prices` | owner + CSRF | replace the tier set of one scope, or of one batch (`store_key`, `batch_id`); new version. An empty `prices[]` closes that set | **no** — versioned; replay with old `base_version` is 409 | `{item_id, store_key, batch_id, version, prices[], catalog:{epoch,head}}` | `404 not_found`, `409 version_conflict`, `422 validation_failed` |
 | PUT | `/v1/admin/items/:id/identifiers` | owner + CSRF | replace one store's identifier set | **yes** — same set is a no-op | `{item_id, store_id, identifiers[], catalog:{epoch,head}}` | `404 not_found`, `409 identifier_conflict`, `422 validation_failed` |
 | GET | `/v1/admin/items/:id/history` | session | price versions for the item | read | `{item_id, prices[], next_cursor, has_more}` | `404 not_found` |
+| GET | `/v1/admin/items/:id/batches` | session | the item's batches in a store, with on-hand, MRP, expiry, open prices (D27) | read | `{item_id, store_id, batches[], next_cursor, has_more}` | `403 store_forbidden`, `404 not_found` |
+| POST | `/v1/admin/items/:id/batches` | owner + CSRF | receive stock: create a batch (`store_id`, `batch_no`, `mrp_minor`, optional `expiry_date`, `qty_base`, `prices[]`); writes the batch, its prices and a `receipt` movement in one batch | **yes** on client `id` | `{batch, prices[], on_hand_qty_base, catalog:{epoch,head}}` | `409 batch_no_exists`, `422 validation_failed` |
+| PATCH | `/v1/admin/batches/:id` | owner + CSRF | edit `batch_no`, `mrp_minor`, `expiry_date`, or retire/unretire; bumps the batch `version` | absolute values; `If-Match` on version | `{batch, catalog:{epoch,head}}` | `404 not_found`, `409 edit_conflict`, `422 validation_failed` |
+| POST | `/v1/admin/batches/:id/adjustments` | owner + CSRF | change quantity by a signed `qty_delta_base`, or set a counted `qty_base` (the Worker writes the difference); `reason` and `note` required | **yes** on client `id` | `{batch_id, movement, on_hand_qty_base}` | `404 not_found`, `422 validation_failed` |
 | GET | `/v1/admin/reports/sales-by-item` | session | per-item qty/amount for a date range | read | `{range, rows[], totals, provisional_until, next_cursor, has_more}` | `400 invalid_range`, `403 store_forbidden`, `413 range_too_large`, `429 rate_limited` |
 | GET | `/v1/admin/reports/day-summary` | session | totals per business date/store | read | `{range, rows[], totals, provisional_until, next_cursor, has_more}` | `400 invalid_range`, `403 store_forbidden`, `413 range_too_large` |
 | GET | `/v1/admin/audit-events` | owner | override/void/flag/admin audit feed | read | `{events[], next_cursor, has_more}` | `400 invalid_query`, `403 forbidden_role` |
@@ -232,10 +237,14 @@ above say 1,000 g sells for 4,000 and 500 g for 2,500. A bill line is different:
 `list_price_minor` are rates per `price_basis_qty_base` (D23), and its `price_breakdown.parts` copy the
 tier rows it used, so the parts sum to the line's `list_amount_minor`.
 
-**Multiple MRP (D27).** An item may have several open price variants, one per printed MRP (April soap at MRP
-₹100, May soap at MRP ₹200). At scan the register lists the open variants for the tier, with the store row
-winning per variant. One variant bills directly. Two or more show a picker with each MRP and selling
-price, and the cashier selects the MRP printed on the pack; nothing is preselected.
+**Batches (D27).** For an item with `uses_batches`, stock arrives in batches: soap received in April at MRP
+₹100 and in May at MRP ₹200 are two `item_batch` documents, each with its own price set (`item_price` rows
+carrying `batch_id`), MRP and optional `expiry_date`. At scan the register lists the store's batches that
+are neither retired nor expired, showing every batch with stock above zero plus the newest batch always,
+newest first. One batch bills directly. Two or more show a picker with batch number, MRP, selling price
+and on-hand, and the cashier picks the batch whose MRP is printed on the pack; nothing is preselected.
+Expired batches show struck out and cannot be picked. On-hand comes from `GET /v1/stock` minus this
+register's unsynced sales; it is an estimate and never blocks a sale.
 
 Snapshot is paged, never one unbounded response:
 `GET /v1/catalog?snapshot=1&epoch=1&snapshot_page=items&snapshot_cursor=...&limit=500`.
@@ -314,7 +323,8 @@ local_seq)` exists with another id → `duplicate_seq`.
  "created_at":1763107200,"payload_sha256":"b0e1...64hex",
  "lines":[{"line_no":1,"item_id":"0192f3c4-8a5b-7c3d-9e1f-2a3b4c5d6e7f",
   "item_name":"Tamarind","dimension":"mass","qty_base":1500,"item_version":3,
-  "price_version":8,"price_store_id":null,"mrp_minor":null,"price_source":"tier","approval_grant_id":null,
+  "price_version":8,"price_store_id":null,"batch_id":null,"batch_no":null,"mrp_minor":null,
+  "price_source":"tier","approval_grant_id":null,
   "price_basis_qty_base":1000,"list_price_minor":4000,"price_minor":4000,
   "list_amount_minor":6500,"discount_minor":0,
   "price_breakdown":{"parts":[{"qty_base":1000,"price_minor":4000},
@@ -371,7 +381,7 @@ Money rules, enforced by the Worker and by the terminal's own triggers (D23):
   inclusive; a per-rate invoice summary is derived from the lines, never computed a second way.
 
 The register's local catalog is the source of truth for the sale (D26). Each line freezes `item_version`,
-`price_version`, `price_store_id` (`null` = franchise default) and `mrp_minor` (the MRP variant) when it is added to the cart, with the
+`price_version`, `price_store_id` (`null` = franchise default) and, for a batched item, `batch_id`, `batch_no` and `mrp_minor` when it is added to the cart, with the
 copied item fields and money. A catalog update that arrives while a cart is open never reprices lines
 already in it; only lines added afterwards use the new catalog. `item` change rows and documents carry
 `version`, and the register applies an item only when that version is not older than the one it holds.
