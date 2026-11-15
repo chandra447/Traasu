@@ -1,0 +1,49 @@
+schema: spec-driven
+
+context: |
+  Traasu: offline-first grocery billing POS for an Indian multi-store chain, replacing GoFrugal.
+  Three deliverables: the register (Wails v3 + Go + local SQLite via modernc.org/sqlite, React + shadcn/ui),
+  the cloud Worker (one Cloudflare Worker, Hono, TypeScript, one D1 per enterprise, routed by Host),
+  and the admin web (SPA served by the Worker, Better Auth).
+
+  openspec/specs/ is the agreed v1 behavior contract, written before code. openspec/roadmap.md says which
+  requirements are built. A story is a change folder that implements named requirements (skip_specs: true);
+  a change that alters agreed behavior carries a MODIFIED/ADDED/REMOVED delta like any OpenSpec change.
+
+  The reasons behind every rule live in docs/DECISIONS.md (D1-D30); a spec cites the D# instead of
+  repeating the argument. The DDL is docs/d1-schema.sql (migration 0001) plus docs/migrations/0002-0008;
+  the same DDL runs on D1 and on the register. docs/check-invariants.py, docs/check-schema.py and
+  docs/explain-queries.py must pass after any schema change.
+
+  Rules that hold everywhere: money is integer paise, quantities are integer base units (g, ml, pcs);
+  bills and bill lines are immutable, corrections are voids; the register's local catalog is the truth for
+  a sale and the server flags but never reprices; stock is tracked per batch but never blocks a sale;
+  every write the register sends is replay-safe.
+
+rules:
+  specs:
+    - One capability per folder, named for a durable behavior (sale, batches), never for a task.
+    - Each requirement states one behavior and ends with its source, e.g. "(D23; 0008 trg_lines_tax_split)".
+    - Scenarios use concrete Indian grocery examples with real numbers (paise, grams), as in check-invariants.py.
+    - 'Where check-invariants.py already holds a case, the scenario names it: "Covered by check-invariants: <label>".'
+    - No library, function or file-layout choices in specs; those go in design.md of a change.
+  proposal:
+    - Name the roadmap story id (e.g. E4-S02) and the requirements it implements.
+    - 'List them under a "## Requirements" heading, one per line as "- <capability>: <Requirement name>" (exact names); docs/check-spec-coverage.py reads this list.'
+    - State what is out of scope.
+  tasks:
+    - Split by deliverable (register, worker, admin web, DDL) and keep each task under half a day.
+    - The last task of any change that touches DDL runs the three docs/ checks.
+    - 'Every scenario of every listed requirement gets a test whose file contains the exact scenario name, or a check-invariants case the scenario cites. The last task runs "mise run spec:coverage openspec/changes/<change>".'
+    - For a high-tier story (AGENTS.md, Risk tiers), the first task runs poteto-mode interrogate on the change folder; findings change the delta spec or add scenarios. Normal-tier stories skip it.
+  design:
+    - When the change admits more than one valid design, compare them (poteto-mode `architect`) and record the pick and the rejected options with reasons.
+
+operations:
+  apply:
+    guidance:
+      - Implement only the requirements the proposal names; report any spec gap instead of inventing behavior.
+      - Treat design.md as the approved design; for a high-tier story (AGENTS.md, Risk tiers) follow the poteto-mode Feature playbook from step 3.
+  archive:
+    guidance:
+      - Update the story status in openspec/roadmap.md when archiving.
