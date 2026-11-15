@@ -56,11 +56,24 @@ All tools and tasks come from `mise.toml`; do not install Python, Go, Node or th
 5. `mise run check` (if DDL changed) and `mise run spec:validate`, then `/openspec-archive-change` and set the story's
    status. Archived changes stay under the coverage gate, so a deleted test fails `spec:validate`.
 
+## Risk tiers
+
+A story's tier is the highest tier among the capabilities it lists in `## Requirements`. Tier is set by what a
+mistake costs (wrong money, stock or GST, a register that cannot bill), not by story size.
+
+| Tier | Capabilities | Process |
+|---|---|---|
+| High | `money-gst`, `bill-push`, `voids`, `numbering`, `stock-ledger`, `catalog-sync`, `repack`, `parent-child`, `archival` | `/poteto-mode`; `interrogate` on the change folder at propose; DDL rules as `check-invariants.py` cases; a test for every scenario |
+| Normal | every other capability | Plain propose/apply; no `interrogate`; a test for every scenario |
+
+The coverage gate applies to both tiers. A normal-tier scenario such as "the owner sees the store list" needs
+only a simple test. Don't write a test just to carry a scenario's name: the gate proves a test exists, the
+diff review proves it tests the scenario.
+
 ## poteto-mode with OpenSpec
 
 OpenSpec decides what is built and keeps the artifacts; `/poteto-mode` (skill at `~/.agents/skills/poteto-mode`)
-decides how the agent works while building it. Use it for stories that touch more than one capability or have
-more than one valid design (E0-S01, E6, E7). For a one-trigger or one-index fix (E0-S02), plain OpenSpec is enough.
+decides how the agent works while building it. Use it for high-tier stories (see Risk tiers).
 
 | OpenSpec step | poteto-mode step | Notes |
 |---|---|---|

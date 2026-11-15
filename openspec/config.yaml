@@ -35,7 +35,7 @@ rules:
     - Split by deliverable (register, worker, admin web, DDL) and keep each task under half a day.
     - The last task of any change that touches DDL runs the three docs/ checks.
     - 'Every scenario of every listed requirement gets a test whose file contains the exact scenario name, or a check-invariants case the scenario cites. The last task runs "mise run spec:coverage openspec/changes/<change>".'
-    - For multi-capability or risky stories, run poteto-mode interrogate on the change folder before the first code task; findings change the delta spec or add scenarios.
+    - For a high-tier story (AGENTS.md, Risk tiers), the first task runs poteto-mode interrogate on the change folder; findings change the delta spec or add scenarios. Normal-tier stories skip it.
   design:
     - When the change admits more than one valid design, compare them (poteto-mode `architect`) and record the pick and the rejected options with reasons.
 
@@ -43,7 +43,7 @@ operations:
   apply:
     guidance:
       - Implement only the requirements the proposal names; report any spec gap instead of inventing behavior.
-      - Treat design.md as the approved design; for multi-capability stories follow the poteto-mode Feature playbook from step 3 (see AGENTS.md).
+      - Treat design.md as the approved design; for a high-tier story (AGENTS.md, Risk tiers) follow the poteto-mode Feature playbook from step 3.
   archive:
     guidance:
       - Update the story status in openspec/roadmap.md when archiving.
