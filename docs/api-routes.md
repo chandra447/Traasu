@@ -127,6 +127,7 @@ the admin web.
 | POST | `/v1/admin/stock-receipts` | owner + CSRF | purchase entry into one book: `{store_id, book_id, reference, lines:[{item_id, qty_base, batch:{batch_no?, mrp_minor, expiry_date?, prices[]}}]}`. **Every line creates a new batch** (D28); a blank `batch_no` is generated from the entry. Writes the receipt, the batches, their prices and one `receipt` movement per line in one `db.batch()` | **yes** on client `id` | `{receipt, book:{id,name}, lines:[{batch, on_hand_qty_base}], catalog:{epoch,head}}` | `404 not_found`, `409 batch_no_exists`, `422 validation_failed` |
 | PATCH | `/v1/admin/batches/:id` | owner + CSRF | edit `batch_no`, `mrp_minor`, `expiry_date`, or retire/unretire; bumps the batch `version`. `book_id` cannot change. | absolute values; `If-Match` on version | `{batch, catalog:{epoch,head}}` | `404 not_found`, `409 edit_conflict`, `422 validation_failed` |
 | POST | `/v1/admin/batches/:id/adjustments` | owner + CSRF | change quantity by a signed `qty_delta_base`, or set a counted `qty_base` (the Worker writes the difference); `reason` and `note` required | **yes** on client `id` | `{batch_id, movement, on_hand_qty_base}` | `404 not_found`, `422 validation_failed` |
+| POST | `/v1/admin/repacks` | owner + CSRF | repack entry (D30): `{store_id, book_id, kind:"pack"\|"unpack", bulk_batch_id, loss_qty_base, reference?, lines:[{item_id, qty_base, batch:{batch_no?, mrp_minor, expiry_date?, prices[]}}]}`. `pack`: every line creates a new batch of the repack item in `book_id`, MRP required; `unpack`: lines name an existing pack batch (`batch_id`) packed from `bulk_batch_id`. One `db.batch()`: header, new batches, their prices, lines; the DDL writes the movements. At least one line. | **yes** on client `id` | `{repack, lines:[{batch, on_hand_qty_base}], bulk:{batch_id, on_hand_qty_base}, catalog:{epoch,head}}` | `404 not_found`, `409 batch_no_exists`, `422 validation_failed` |
 | GET | `/v1/admin/reports/sales-by-item` | session | per-item qty/amount for a date range | read | `{range, rows[], totals, provisional_until, next_cursor, has_more}` | `400 invalid_range`, `403 store_forbidden`, `413 range_too_large`, `429 rate_limited` |
 | GET | `/v1/admin/reports/day-summary` | session | totals per business date/store | read | `{range, rows[], totals, provisional_until, next_cursor, has_more}` | `400 invalid_range`, `403 store_forbidden`, `413 range_too_large` |
 | GET | `/v1/admin/audit-events` | owner | override/void/flag/admin audit feed | read | `{events[], next_cursor, has_more}` | `400 invalid_query`, `403 forbidden_role` |
@@ -252,6 +253,11 @@ can switch the line to it. Expired batches cannot be picked. On-hand comes from
 `GET /v1/stock` minus this register's unsynced sales; it is an estimate and never blocks a sale, and a
 quantity above a batch's on-hand shows a warning.
 
+**Parent and child items (D29).** An `item` document may carry `parent_item_id` and `content_qty_base`. A
+child has no batches: its line uses the child's item-level prices and takes `qty_base × content_qty_base`
+of the parent's base units from a parent batch, chosen by book priority among batches with stock, then the
+most recent; no prompt. Repack items (D30) are ordinary batched items to the register.
+
 Snapshot is paged, never one unbounded response:
 `GET /v1/catalog?snapshot=1&epoch=1&snapshot_page=items&snapshot_cursor=...&limit=500`.
 Pages cover `items`, `prices`, `identifiers`, `users`, `reference` (units/tax rates) and `store`
@@ -330,6 +336,7 @@ local_seq)` exists with another id → `duplicate_seq`.
  "lines":[{"line_no":1,"item_id":"0192f3c4-8a5b-7c3d-9e1f-2a3b4c5d6e7f",
   "item_name":"Tamarind","dimension":"mass","qty_base":1500,"item_version":3,
   "price_version":8,"price_store_id":null,"batch_id":null,"batch_no":null,"mrp_minor":null,
+  "stock_item_id":null,"stock_batch_id":null,"stock_qty_base":null,
   "price_source":"tier","approval_grant_id":null,
   "price_basis_qty_base":1000,"list_price_minor":4000,"price_minor":4000,
   "list_amount_minor":6500,"discount_minor":0,
@@ -387,7 +394,7 @@ Money rules, enforced by the Worker and by the terminal's own triggers (D23):
   inclusive; a per-rate invoice summary is derived from the lines, never computed a second way.
 
 The register's local catalog is the source of truth for the sale (D26). Each line freezes `item_version`,
-`price_version`, `price_store_id` (`null` = franchise default) and, for a batched item, `batch_id`, `batch_no` and `mrp_minor` when it is added to the cart, with the
+`price_version`, `price_store_id` (`null` = franchise default) and, for a batched item, `batch_id`, `batch_no` and `mrp_minor`, or for a child item (D29) `stock_item_id`, `stock_batch_id` and `stock_qty_base`, when it is added to the cart, with the
 copied item fields and money. A catalog update that arrives while a cart is open never reprices lines
 already in it; only lines added afterwards use the new catalog. `item` change rows and documents carry
 `version`, and the register applies an item only when that version is not older than the one it holds.

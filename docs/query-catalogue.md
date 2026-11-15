@@ -108,6 +108,23 @@ WHERE store_id = ?1 AND seq > ?2 ORDER BY seq LIMIT 500;
 Seeks `idx_batch_stock_store_seq`. The register stores `on_hand = server value − its unsynced sales of
 that batch`, so its own pending sales are not counted twice.
 
+A child item (D29) has no batches of its own. Its line is priced from the child's item-level prices
+(`batch_id` NULL) and takes stock from a parent batch, with no prompt:
+
+```sql
+-- ?1 parent item (items.parent_item_id of the scanned child), ?2 store, ?3 business date
+SELECT b.id FROM item_batches b
+JOIN books k ON k.id = b.book_id AND k.active = 1
+LEFT JOIN batch_stock s ON s.batch_id = b.id
+WHERE b.item_id = ?1 AND b.store_id = ?2 AND b.retired_at IS NULL
+  AND (b.expiry_date IS NULL OR b.expiry_date >= ?3)
+ORDER BY IFNULL(s.on_hand_qty_base, 0) > 0 DESC, k.priority, b.received_at DESC, b.id DESC
+LIMIT 1;
+```
+
+The line records `stock_item_id`, `stock_batch_id` and `stock_qty_base = qty_base × content_qty_base`; the
+sale movement must match them (`trg_movements_child_line`). Same index as the batch lookup.
+
 ## 4. All tiers for an item (pricing decomposition runs in Go)
 
 ```sql

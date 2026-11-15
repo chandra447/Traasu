@@ -27,9 +27,10 @@ VALUES ('ss1', 'u1', 's1', 't1', 'pin_offline', 1000);
 seq = [0]
 
 
-def line(no, item="i1", total=1029, taxable=980, cgst=24, sgst=25, igst=0, list_amount=None, discount=0):
+def line(no, item="i1", total=1029, taxable=980, cgst=24, sgst=25, igst=0, list_amount=None, discount=0,
+         stock=(None, None, None)):
     return dict(no=no, item=item, total=total, taxable=taxable, cgst=cgst, sgst=sgst, igst=igst,
-                list_amount=total + discount if list_amount is None else list_amount, discount=discount)
+                list_amount=total + discount if list_amount is None else list_amount, discount=discount, stock=stock)
 
 
 def push(bill_id, lines, total=None, subtotal=None, tax=None, rounding=0, created_at=1500, date="2026-11-14",
@@ -47,11 +48,11 @@ def push(bill_id, lines, total=None, subtotal=None, tax=None, rounding=0, create
                 """INSERT INTO bill_lines (bill_id, line_no, item_id, item_name, dimension, qty_base, price_version,
                      price_source, list_price_minor, price_minor, price_basis_qty_base, discount_minor, list_amount_minor,
                      price_breakdown, line_total_minor, taxable_minor, tax_rate_bp, cgst_minor, sgst_minor, cess_minor,
-                     igst_minor)
-                   VALUES (?, ?, ?, 'x', 'count', 1, 1, 'list', ?, ?, 1, ?, ?, '{}', ?, ?, 500, ?, ?, 0, ?)
+                     igst_minor, stock_item_id, stock_batch_id, stock_qty_base)
+                   VALUES (?, ?, ?, 'x', 'count', 1, 1, 'list', ?, ?, 1, ?, ?, '{}', ?, ?, 500, ?, ?, 0, ?, ?, ?, ?)
                    ON CONFLICT (bill_id, line_no) DO NOTHING""",
                 (bill_id, l["no"], l["item"], l["list_amount"], l["list_amount"], l["discount"], l["list_amount"],
-                 l["total"], l["taxable"], l["cgst"], l["sgst"], l["igst"]))
+                 l["total"], l["taxable"], l["cgst"], l["sgst"], l["igst"], *l["stock"]))
         con.execute(
             """INSERT INTO bills (id, store_id, terminal_id, user_id, auth_method, business_date, local_seq, display_no,
                  total_minor, subtotal_minor, tax_minor, rounding_minor, created_at, staff_session_id)
@@ -338,6 +339,139 @@ expect("swap via a free priority (one db.batch)", "/".join([
     write("UPDATE books SET priority = 2, version = 3 WHERE id = 'k_main'")]), "OK/OK/OK")
 expect("after the swap the Godown is book 1, so C is used instead of B", picker(item="oil"), ["o_c", "o_a"])
 expect("delete a book", write("DELETE FROM books WHERE id = 'k_godown'"), "book_deactivate_only")
+
+# Parent/child (D29): stock lives in the parent's batches in its base unit; children are items with no stock.
+# Books in s1 are now Godown = 1, Main = 2 (swapped above).
+def item(iid, dimension, unit, batched, parent=None, content=None):
+    return write("INSERT INTO items (id, name, dimension, pricing_mode, base_unit, default_sales_unit, uses_batches, "
+                 "parent_item_id, content_qty_base, updated_at) VALUES (?, ?, ?, 'fixed_only', ?, ?, ?, ?, ?, 0)",
+                 iid, iid, dimension, unit, unit, batched, parent, content)
+
+
+# The register's lookup for a child line (query-catalogue.md §3): the parent batch with stock from book 1 first,
+# most recent within a book; with no stock anywhere, book 1's most recent (it goes negative).
+def child_pick(parent, day="2026-11-14"):
+    return con.execute("""
+      SELECT b.id FROM item_batches b
+      JOIN books k ON k.id = b.book_id AND k.active = 1
+      LEFT JOIN batch_stock s ON s.batch_id = b.id
+      WHERE b.item_id = ? AND b.store_id = 's1' AND b.retired_at IS NULL
+        AND (b.expiry_date IS NULL OR b.expiry_date >= ?)
+      ORDER BY IFNULL(s.on_hand_qty_base, 0) > 0 DESC, k.priority, b.received_at DESC, b.id DESC
+      LIMIT 1""", (parent, day)).fetchone()[0]
+
+
+expect("coffee sack (parent, grams) and Coffee 1 kg (child, 1000 g per piece)",
+       item("coffee", "mass", "g", 1) + "/" + item("coffee_1kg", "count", "pcs", 0, "coffee", 1000), "OK/OK")
+expect("a batched child", item("coffee_x", "count", "pcs", 1, "coffee", 1000), "item_stock_link_invalid")
+expect("a child without a content", item("coffee_y", "count", "pcs", 0, "coffee"), "item_stock_link_invalid")
+expect("a child of a child (one level)", item("coffee_z", "count", "pcs", 0, "coffee_1kg", 1),
+       "item_stock_link_invalid")
+expect("a child of an unbatched item", item("dal_c", "count", "pcs", 0, "i1", 1), "item_stock_link_invalid")
+expect("sack in Main (20 kg), empty sack in the Godown",
+       batch("cf_main", "CF-M", 200000, 100, item="coffee") + "/" +
+       batch("cf_god", "CF-G", 200000, 50, item="coffee", book="k_godown") + "/" +
+       move("rcf1", "cf_main", "in", 20000, "receipt", item="coffee"), "OK/OK/OK")
+expect("child line draws from the batch with stock", child_pick("coffee"), "cf_main")
+expect("stock in book 1 (Godown) as well: book 1 first",
+       move("rcf2", "cf_god", "in", 5000, "receipt", item="coffee") + "/" + child_pick("coffee"), "OK/cf_god")
+expect("sell 1 x Coffee 1 kg: 1000 g out of the Godown sack",
+       push("bcf1", [line(1, item="coffee_1kg", stock=("coffee", "cf_god", 1000))]) + "/" +
+       move("mcf1", "cf_god", "out", 1000, "sale", bill="bcf1", line_no=1, item="coffee") + "/" +
+       str(on_hand("cf_god")), "OK/OK/4000")
+expect("a child's sale movement on the child item",
+       push("bcf2", [line(1, item="coffee_1kg", stock=("coffee", "cf_god", 1000))]) + "/" +
+       move("mcf2", "cf_god", "out", 1, "sale", bill="bcf2", line_no=1, item="coffee_1kg"),
+       "OK/child_movement_mismatch")
+expect("a child line naming a parent without a quantity",
+       push("bcf3", [line(1, item="coffee_1kg", stock=("coffee", "cf_god", None))]),
+       "CHECK constraint failed: (stock_qty_base IS NULL) = (stock_item_id IS NULL) AND (stock_qty_base IS NULL "
+       "OR stock_qty_base > 0)")
+expect("void the child sale: the 1000 g go back to the sack", write(
+    "INSERT INTO bill_voids (id, bill_id, store_id, terminal_id, user_id, reason, created_at) "
+    "VALUES ('vcf1', 'bcf1', 's1', 't1', 'u1', 'wrong item', 4000)") + "/" + str(on_hand("cf_god")), "OK/5000")
+expect("parent turned unbatched while it has children",
+       write("UPDATE items SET uses_batches = 0, version = 2 WHERE id = 'coffee'"), "item_stock_link_invalid")
+
+# Box -> pack -> piece without a chain: every size is a child of the piece item.
+expect("biscuit (pieces), pack of 10 and box of 20 packs, all children of the piece",
+       item("biscuit", "count", "pcs", 1) + "/" + item("biscuit_pack", "count", "pcs", 0, "biscuit", 10) + "/" +
+       item("biscuit_box", "count", "pcs", 0, "biscuit", 200), "OK/OK/OK")
+expect("3 boxes received = 600 pieces; sell a box, then a pack",
+       batch("bs1", "BS-1", 1000, 100, item="biscuit") + "/" +
+       move("rbs1", "bs1", "in", 3 * 200, "receipt", item="biscuit") + "/" +
+       move("mbs1", "bs1", "out", 200, "sale", item="biscuit") + "/" +
+       move("mbs2", "bs1", "out", 10, "sale", item="biscuit") + "/" + str(on_hand("bs1")), "OK/OK/OK/OK/390")
+
+# Repack (D30): Rice 25 kg sacks (bulk, grams) packed into Rice 1 kg and Rice 500 g (own batches and stock)
+expect("bulk and repack items",
+       item("rice25", "mass", "g", 1) + "/" + item("rice25b", "mass", "g", 1) + "/" +
+       item("rice1kg", "count", "pcs", 1, content=1000) + "/" + item("rice500", "count", "pcs", 1, content=500),
+       "OK/OK/OK/OK")
+
+
+def source(repack_item, bulk):
+    return write("INSERT INTO item_repack_sources (item_id, bulk_item_id, created_at) VALUES (?, ?, 0)",
+                 repack_item, bulk)
+
+
+expect("map Rice 1 kg and Rice 500 g to the sack; Rice 1 kg also to a second rice bulk",
+       source("rice1kg", "rice25") + "/" + source("rice500", "rice25") + "/" + source("rice1kg", "rice25b"),
+       "OK/OK/OK")
+expect("a bulk in another base unit", source("rice1kg", "biscuit"), "repack_source_invalid")
+expect("a repack item as a bulk (chain)", source("rice500", "rice1kg"), "repack_source_invalid")
+expect("a child as a repack item", source("coffee_1kg", "rice25"), "repack_source_invalid")
+expect("a repack item as a parent", item("rice_c", "count", "pcs", 0, "rice1kg", 1), "item_stock_link_invalid")
+expect("sack batch: 25 kg received in Main",
+       batch("r_b1", "RICE-1", 150000, 100, item="rice25") + "/" + batch("r_b2", "RICE-2", 150000, 200, item="rice25")
+       + "/" + move("rr1", "r_b1", "in", 25000, "receipt", item="rice25"), "OK/OK/OK")
+
+
+def repack(rid, kind, bulk_batch, loss=0, book="k_main"):
+    return write("INSERT INTO repacks (id, store_id, book_id, kind, bulk_batch_id, loss_qty_base, packed_at, "
+                 "created_at) VALUES (?, 's1', ?, ?, ?, ?, 500, 500)", rid, book, kind, bulk_batch, loss)
+
+
+def pack_batch(bid, item_id, rid, mrp, book="k_main"):
+    return write("INSERT INTO item_batches (id, item_id, store_id, book_id, batch_no, mrp_minor, received_at, "
+                 "updated_at, repack_id) VALUES (?, ?, 's1', ?, ?, ?, 500, 0, ?)", bid, item_id, book, bid, mrp, rid)
+
+
+def repack_line(rid, no, item_id, bid, qty, content):
+    return write("INSERT INTO repack_lines (repack_id, line_no, item_id, batch_id, qty_base, content_qty_base) "
+                 "VALUES (?, ?, ?, ?, ?, ?)", rid, no, item_id, bid, qty, content)
+
+
+expect("pack 20 x 1 kg and 9 x 500 g, 100 g lost: sack 25000 - 20000 - 4500 - 100", "/".join([
+    repack("rp1", "pack", "r_b1", loss=100),
+    pack_batch("rb_1kg", "rice1kg", "rp1", 6000), pack_batch("rb_500", "rice500", "rp1", 3200),
+    repack_line("rp1", 1, "rice1kg", "rb_1kg", 20, 1000), repack_line("rp1", 2, "rice500", "rb_500", 9, 500),
+    str(on_hand("r_b1")), str(on_hand("rb_1kg")), str(on_hand("rb_500"))]), "OK/OK/OK/OK/OK/400/20/9")
+expect("a pack batch without an MRP", pack_batch("rb_nomrp", "rice1kg", "rp1", None) + "/" +
+       repack_line("rp1", 3, "rice1kg", "rb_nomrp", 1, 1000), "OK/repack_line_invalid")
+expect("a pack line at another content", pack_batch("rb_999", "rice1kg", "rp1", 6000) + "/" +
+       repack_line("rp1", 4, "rice1kg", "rb_999", 1, 999), "OK/repack_line_invalid")
+expect("a second line into the same new batch", repack_line("rp1", 5, "rice1kg", "rb_1kg", 1, 1000),
+       "repack_line_invalid")
+expect("a purchase-entry batch as a pack line", batch("rb_buy", "RB-BUY", 6000, 600, item="rice1kg") + "/" +
+       repack_line("rp1", 6, "rice1kg", "rb_buy", 1, 1000), "OK/repack_line_invalid")
+expect("a pack batch in another book than the repack", pack_batch("rb_g", "rice1kg", "rp1", 6000, book="k_godown"),
+       "repack_batch_scope")
+expect("a repack from an item that is no bulk", repack("rp_x", "pack", "cf_main"), "repack_scope_invalid")
+expect("unpack 5 x 1 kg back into the sack", repack("rp2", "unpack", "r_b1") + "/" +
+       repack_line("rp2", 1, "rice1kg", "rb_1kg", 5, 1000) + "/" + str(on_hand("r_b1")) + "/" + str(on_hand("rb_1kg")),
+       "OK/OK/5400/15")
+expect("unpack into a sack the packs did not come from", repack("rp3", "unpack", "r_b2") + "/" +
+       repack_line("rp3", 1, "rice1kg", "rb_1kg", 1, 1000), "OK/repack_line_invalid")
+expect("repack more than the sack holds: allowed, the sack goes negative", "/".join([
+    repack("rp4", "pack", "r_b1"), pack_batch("rb_1kg2", "rice1kg", "rp4", 6000),
+    repack_line("rp4", 1, "rice1kg", "rb_1kg2", 30, 1000), str(on_hand("r_b1"))]), "OK/OK/OK/-24600")
+expect("edit or delete a saved repack",
+       write("UPDATE repacks SET loss_qty_base = 0 WHERE id = 'rp1'") + "/" +
+       write("DELETE FROM repack_lines WHERE repack_id = 'rp1'"), "repack_immutable/repack_immutable")
+expect("rice ledger nets to the movements", con.execute(
+    "SELECT SUM(CASE direction WHEN 'in' THEN qty_base ELSE -qty_base END) FROM inventory_movements "
+    "WHERE batch_id = 'r_b1'").fetchone()[0], -24600)
 
 expect("schema_version after all migrations", con.execute("SELECT schema_version FROM schema_meta").fetchone(),
        (len(list((here / "migrations").glob("*.sql"))) + 1,))

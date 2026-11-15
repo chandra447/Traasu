@@ -644,3 +644,91 @@ line from another batch.
 Cost: one more join per scan (indexed, plus the price row for the scanned tier), one more table to sync (`book`
 catalog entity), and a purchase entry screen. Without a transfer, stock received into the wrong book is fixed
 with two adjustments.
+
+## D29. Parent and child items: a child sells from the parent's stock
+
+GoFrugal's "Parent"/"Child" preparation status. A coffee shop buys a 20 kg sack and weighs out 1 kg at the
+counter; the stock is the sack, not the 1 kg packs. In GoFrugal's demo, selling one COFFEE 1KG takes the
+parent COFFEE 20KG from 1.00 to 0.95 packs, and the child's stock stays 0
+([Parent and Child](https://community.gofrugal.com/portal/en/kb/gofrugalretaileasy/inventory-management/parent-child-management/articles/concept-of-parent-and-child-in-item-master-its-applicability),
+video `QsXeATRUDPE`). The child has its own name, rate and GST; nothing is inherited.
+
+| Column (0008) | Holds |
+|---|---|
+| `items.parent_item_id` | The item whose stock a sale takes. NULL for an ordinary item. |
+| `items.content_qty_base` | Parent base units per child base unit: Coffee 1 kg = 1000 (g) |
+| `bill_lines.stock_item_id`, `stock_batch_id`, `stock_qty_base` | Copied at sale: the parent, its batch and the base units taken |
+
+Stock is held in the parent's **base unit**, so a child always takes a whole number: 1000 g, not 0.05 of a
+sack. A box of 20 packs of 10 biscuits is therefore not a chain. The piece is the parent (stock in pieces),
+and the pack (10) and box (200) are both children of it. A purchase entry of 3 boxes records 600 pieces. A
+sack, a 2 kg bag and a 500 g scoop work the same way: all children of the item stocked in grams.
+
+| Rule | Enforced by |
+|---|---|
+| A child has a content, is not batched, and its parent is batched | `trg_items_stock_link_ins`, `_upd` |
+| One level: a child is never a parent, a repack item or a bulk item; a parent with children stays batched | same, and `trg_item_repack_sources_shape` |
+| A child's sale movement is on the line's `stock_item_id`, `stock_batch_id`, `stock_qty_base` | `trg_movements_child_line` |
+| A void puts the parent's stock back | `trg_bill_voids_restock` (copies the movement as before) |
+
+**Which parent batch.** The register takes the parent batch with stock from book 1 first, the most recent
+within a book; with no stock anywhere, book 1's most recent, which goes negative. There is no MRP prompt: the
+child is priced from its own item-level prices, and its `batch_id` stays NULL so the D26 price check does not
+look in the parent's batch prices (`query-catalogue.md` §3).
+
+**Children or tiers?** One item with tier prices and identifiers carrying `qty_base` already sells a 500 g
+pack and a 20 kg sack from one stock. Use a child only when the pack needs its own name, price list, GST/HSN
+or report line.
+
+Cost: a parent must use batches. Reports show a child's sales under the child (`bill_lines.item_id`) and its
+stock under the parent; the stock report has to explain that.
+
+## D30. Repack: bulk stock becomes packs with their own batches, MRP and stock
+
+GoFrugal's "Bulk"/"Repackage". A 25 kg rice sack is opened and packed into 1 kg and 500 g packets that are
+priced, labelled and stocked on their own
+([Repack setup](https://community.gofrugal.com/portal/en/kb/gofrugalretaileasyoncloud/master-management/item/item-master/articles/how-to-setup-products-for-repacking-bulk-to-child-repack-12-11-2025),
+[Inventory Repack](https://help.retaileasy.gofrugal.com/Inventory-Repack.html),
+[FAQs](https://help.retaileasy.gofrugal.com/FAQs-Repacking.html), video `7jD0uq0GGIU`).
+
+| GoFrugal | Here |
+|---|---|
+| Repack item names its bulk item; several bulks allowed | `item_repack_sources(item_id, bulk_item_id)`; every bulk of one repack item has the same base unit |
+| "Repack Conversion (Grams)" on both items | `items.content_qty_base` on the repack item only (bulk base units per pack); the bulk's stock is already in grams |
+| Repack entry: qty, selling, MRP, expiry, repack date | `repacks` + `repack_lines`; each line makes a **new batch** of the repack item in the entry's book, MRP required, its own prices (D27) |
+| Conversion loss field | `repacks.loss_qty_base`, out of the bulk batch |
+| Saved repack cannot be edited or cancelled | `trg_repacks_frozen`, `trg_repack_lines_frozen`, no delete |
+| ReUse (F10, negative qty) | `kind = 'unpack'`: packs go back into the bulk batch they were packed from |
+| Repack allowed in negative stock | Allowed; the bulk batch goes negative like any other |
+| Cost auto-calculated | Not stored (purchases and cost stay out, open item) |
+| Short/excess | An `adjustment` on the bulk batch (D27) |
+
+**The ledger is written by the DDL.** A pack line inserts two `repack` movements: packs × content out of the
+bulk batch and packs into the new batch; an unpack reverses both; the loss is one more movement out of the
+bulk. A repack can therefore never move one side only. 25 kg packed into 20 × 1 kg and 9 × 500 g with 100 g
+spilt leaves 400 g in the sack (`check-invariants.py`).
+
+**Where.** Admin web, online, like a purchase entry (D28): the server stays the stock truth, and the register
+receives the new batches, prices and stock through the catalog and `GET /v1/stock`. One `db.batch()`: header,
+new batches, their prices, lines.
+
+**One level** (with D29). A repack item is batched and is never a child, a parent or a bulk; a bulk item is
+never a child or a repack item. A bulk item may also be a parent: loose scoops and repacked packets can come
+out of the same sack. Opening a 2 kg pack to make 500 g packs is an unpack followed by a pack.
+
+Cost: two movements per repack line plus the `batch_stock` upserts, and `inventory_movements.reason` gains
+`repack`. A repack entry with a header and no lines is not rejected by the DDL; the Worker refuses it.
+
+### Item loading from a GoFrugal export
+
+| GoFrugal Preparation Status | Traasu item |
+|---|---|
+| Trade As Is | ordinary item |
+| Parent | batched item, stock in its base unit; opening stock = packs × "Repack Conversion (Grams)" |
+| Child | `parent_item_id` = the parent's code, `content_qty_base` = the child's grams, `uses_batches = 0` |
+| Bulk | batched item in grams; opening stock = packs × grams |
+| Repackage | batched item, `content_qty_base` = its grams, one `item_repack_sources` row per bulk |
+| Weight to Qty | not mapped (not shown in the GoFrugal material; ask before importing such items) |
+
+Import order: parents and bulks, then children and repack items, then the source rows. The triggers reject
+any other order.

@@ -218,6 +218,11 @@ ALTER TABLE items ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK (version >
 ALTER TABLE bill_lines ADD COLUMN item_version INTEGER NOT NULL DEFAULT 1 CHECK (item_version > 0);
 -- 1 = the item is sold from batches (D27); 0 = one item-level price set (loose goods).
 ALTER TABLE items ADD COLUMN uses_batches INTEGER NOT NULL DEFAULT 0 CHECK (uses_batches IN (0, 1));
+-- Parent/child and repack (D29, D30). parent_item_id: a child item holds no
+-- stock; a sale takes content_qty_base of the parent's base units per child
+-- base unit. content_qty_base on a repack item: bulk base units in one pack.
+ALTER TABLE items ADD COLUMN parent_item_id TEXT REFERENCES items(id) ON DELETE RESTRICT;
+ALTER TABLE items ADD COLUMN content_qty_base INTEGER CHECK (content_qty_base IS NULL OR content_qty_base > 0);
 
 -- A version never goes backwards, and the same version never means two
 -- documents. Equal version with equal content is allowed: that is a terminal
@@ -234,7 +239,8 @@ WHEN NEW.version < OLD.version
      OR NEW.allow_discount_pct IS NOT OLD.allow_discount_pct
      OR NEW.restrict_price_edit IS NOT OLD.restrict_price_edit
      OR NEW.prompt_qty IS NOT OLD.prompt_qty OR NEW.scale_qty IS NOT OLD.scale_qty
-     OR NEW.active IS NOT OLD.active OR NEW.uses_batches IS NOT OLD.uses_batches))
+     OR NEW.active IS NOT OLD.active OR NEW.uses_batches IS NOT OLD.uses_batches
+     OR NEW.parent_item_id IS NOT OLD.parent_item_id OR NEW.content_qty_base IS NOT OLD.content_qty_base))
 BEGIN
   SELECT RAISE(ABORT, 'item_version_not_bumped');
 END;
@@ -399,7 +405,7 @@ ALTER TABLE bill_lines ADD COLUMN mrp_minor INTEGER CHECK (mrp_minor IS NULL OR 
 ALTER TABLE inventory_movements ADD COLUMN batch_id TEXT;
 ALTER TABLE inventory_movements ADD COLUMN store_id TEXT;
 ALTER TABLE inventory_movements ADD COLUMN reason TEXT NOT NULL DEFAULT 'sale'
-  CHECK (reason IN ('receipt', 'adjustment', 'sale', 'void'));
+  CHECK (reason IN ('receipt', 'adjustment', 'sale', 'void', 'repack'));
 ALTER TABLE inventory_movements ADD COLUMN note TEXT;
 ALTER TABLE inventory_movements ADD COLUMN created_by TEXT;
 
@@ -480,6 +486,247 @@ BEGIN
          NEW.created_at, NEW.created_at, m.batch_id, m.store_id, 'void', NEW.user_id
   FROM inventory_movements m
   WHERE m.bill_id = NEW.bill_id AND m.reason = 'sale';
+END;
+
+-- ---------------------------------------------------------------------------
+-- Parent/child items (D29), GoFrugal's "Parent"/"Child" preparation status.
+-- A child (Coffee 1 kg, Biscuit pack of 10) is its own item: own name, prices,
+-- tax and barcodes, but no stock. Selling one takes content_qty_base of the
+-- parent's base units out of a parent batch. A parent may have many children
+-- (piece, pack of 10, box of 200); a child is never a parent, a repack item or
+-- a bulk item, so stock never chains. Parents are batched: stock lives in batches.
+-- ---------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_item_id) WHERE parent_item_id IS NOT NULL;
+
+-- Repack (D30), GoFrugal's "Bulk"/"Repackage". A repack item (Rice 1 kg) has
+-- its own batches and stock, filled from one of its mapped bulk items (Rice 25 kg
+-- sack). content_qty_base on the repack item = bulk base units in one pack;
+-- every bulk of one repack item has the same base unit, so that number holds for all.
+CREATE TABLE IF NOT EXISTS item_repack_sources (
+  item_id       TEXT NOT NULL REFERENCES items(id) ON DELETE RESTRICT,   -- the repack item
+  bulk_item_id  TEXT NOT NULL REFERENCES items(id) ON DELETE RESTRICT,
+  created_at    INTEGER NOT NULL,
+  PRIMARY KEY (item_id, bulk_item_id),
+  CHECK (item_id <> bulk_item_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_item_repack_sources_bulk ON item_repack_sources(bulk_item_id);
+
+-- One level: a repack item is batched, has a content, is no child, parent or
+-- bulk; a bulk item is batched, no child and no repack item.
+CREATE TRIGGER IF NOT EXISTS trg_item_repack_sources_shape
+BEFORE INSERT ON item_repack_sources
+WHEN NOT EXISTS (SELECT 1 FROM items i, items b
+                 WHERE i.id = NEW.item_id AND b.id = NEW.bulk_item_id
+                   AND i.parent_item_id IS NULL AND i.uses_batches = 1 AND i.content_qty_base IS NOT NULL
+                   AND b.parent_item_id IS NULL AND b.uses_batches = 1)
+  OR EXISTS (SELECT 1 FROM item_repack_sources s
+             WHERE s.item_id = NEW.bulk_item_id OR s.bulk_item_id = NEW.item_id)
+  OR EXISTS (SELECT 1 FROM items c WHERE c.parent_item_id = NEW.item_id)
+  OR EXISTS (SELECT 1 FROM item_repack_sources s JOIN items b2 ON b2.id = s.bulk_item_id
+             WHERE s.item_id = NEW.item_id
+               AND b2.base_unit IS NOT (SELECT base_unit FROM items WHERE id = NEW.bulk_item_id))
+BEGIN
+  SELECT RAISE(ABORT, 'repack_source_invalid');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_item_repack_sources_frozen
+BEFORE UPDATE ON item_repack_sources
+BEGIN
+  SELECT RAISE(ABORT, 'repack_source_immutable');
+END;
+
+-- The child side of the same rule, on the item row.
+CREATE TRIGGER IF NOT EXISTS trg_items_stock_link_ins
+BEFORE INSERT ON items
+WHEN NEW.parent_item_id IS NOT NULL AND (
+       NEW.content_qty_base IS NULL OR NEW.uses_batches = 1 OR NEW.parent_item_id = NEW.id
+    OR NOT EXISTS (SELECT 1 FROM items p
+                   WHERE p.id = NEW.parent_item_id AND p.parent_item_id IS NULL AND p.uses_batches = 1
+                     AND NOT EXISTS (SELECT 1 FROM item_repack_sources s WHERE s.item_id = p.id)))
+BEGIN
+  SELECT RAISE(ABORT, 'item_stock_link_invalid');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_items_stock_link_upd
+BEFORE UPDATE OF parent_item_id, content_qty_base, uses_batches ON items
+WHEN (NEW.parent_item_id IS NOT NULL AND (
+        NEW.content_qty_base IS NULL OR NEW.uses_batches = 1 OR NEW.parent_item_id = NEW.id
+     OR NOT EXISTS (SELECT 1 FROM items p
+                    WHERE p.id = NEW.parent_item_id AND p.parent_item_id IS NULL AND p.uses_batches = 1
+                      AND NOT EXISTS (SELECT 1 FROM item_repack_sources s WHERE s.item_id = p.id))
+     OR EXISTS (SELECT 1 FROM items c WHERE c.parent_item_id = NEW.id)
+     OR EXISTS (SELECT 1 FROM item_repack_sources s WHERE s.item_id = NEW.id OR s.bulk_item_id = NEW.id)))
+  OR (NEW.uses_batches = 0 AND (
+        EXISTS (SELECT 1 FROM items c WHERE c.parent_item_id = NEW.id)
+     OR EXISTS (SELECT 1 FROM item_repack_sources s WHERE s.item_id = NEW.id OR s.bulk_item_id = NEW.id)))
+  OR (NEW.content_qty_base IS NULL AND EXISTS (SELECT 1 FROM item_repack_sources s WHERE s.item_id = NEW.id))
+BEGIN
+  SELECT RAISE(ABORT, 'item_stock_link_invalid');
+END;
+
+-- A child line copies where its stock came from (D29). Plain TEXT like
+-- batch_id: an unknown parent batch is flagged by the Worker, never rejected.
+-- batch_id stays NULL on a child line: the child is priced from its own
+-- item-level prices, so the D26 price check must not look in the parent batch.
+ALTER TABLE bill_lines ADD COLUMN stock_item_id TEXT;
+ALTER TABLE bill_lines ADD COLUMN stock_batch_id TEXT;
+ALTER TABLE bill_lines ADD COLUMN stock_qty_base INTEGER
+  CHECK ((stock_qty_base IS NULL) = (stock_item_id IS NULL) AND (stock_qty_base IS NULL OR stock_qty_base > 0));
+
+-- The sale movement of a child line moves the parent's stock, exactly as the
+-- line recorded it (lines are inserted before movements, D12).
+CREATE TRIGGER IF NOT EXISTS trg_movements_child_line
+BEFORE INSERT ON inventory_movements
+WHEN NEW.reason = 'sale' AND NEW.bill_id IS NOT NULL AND EXISTS (
+  SELECT 1 FROM bill_lines l
+  WHERE l.bill_id = NEW.bill_id AND l.line_no = NEW.bill_line_no AND l.stock_item_id IS NOT NULL
+    AND (NEW.item_id IS NOT l.stock_item_id OR NEW.qty_base IS NOT l.stock_qty_base
+         OR NEW.batch_id IS NOT l.stock_batch_id))
+BEGIN
+  SELECT RAISE(ABORT, 'child_movement_mismatch');
+END;
+
+-- A repack entry (D30), entered in admin like a purchase entry. kind 'pack'
+-- takes stock out of one bulk batch and makes one new batch per line in book_id;
+-- 'unpack' (GoFrugal ReUse) puts packs from book_id back into the bulk batch
+-- they were packed from. loss_qty_base leaves the bulk batch either way
+-- (spillage, the 100 g left over from 1 kg in 300 g packs). Never edited:
+-- a mistake is undone by an unpack or an adjustment.
+CREATE TABLE IF NOT EXISTS repacks (
+  id             TEXT PRIMARY KEY,
+  store_id       TEXT NOT NULL REFERENCES stores(id) ON DELETE RESTRICT,
+  book_id        TEXT NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+  kind           TEXT NOT NULL CHECK (kind IN ('pack', 'unpack')),
+  bulk_batch_id  TEXT NOT NULL REFERENCES item_batches(id) ON DELETE RESTRICT,
+  loss_qty_base  INTEGER NOT NULL DEFAULT 0 CHECK (loss_qty_base >= 0),
+  reference      TEXT,
+  packed_at      INTEGER NOT NULL,
+  created_by     TEXT REFERENCES users(id) ON DELETE RESTRICT,
+  created_at     INTEGER NOT NULL,
+  note           TEXT
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_repacks_store ON repacks(store_id, packed_at);
+CREATE INDEX IF NOT EXISTS idx_repacks_bulk ON repacks(bulk_batch_id);
+
+CREATE TABLE IF NOT EXISTS repack_lines (
+  repack_id         TEXT NOT NULL REFERENCES repacks(id) ON DELETE RESTRICT,
+  line_no           INTEGER NOT NULL CHECK (line_no > 0),
+  item_id           TEXT NOT NULL REFERENCES items(id) ON DELETE RESTRICT,         -- the repack item
+  batch_id          TEXT NOT NULL REFERENCES item_batches(id) ON DELETE RESTRICT,  -- pack: the new batch
+  qty_base          INTEGER NOT NULL CHECK (qty_base > 0),                         -- packs, in its base unit
+  content_qty_base  INTEGER NOT NULL CHECK (content_qty_base > 0),                 -- copied at entry
+  PRIMARY KEY (repack_id, line_no)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_repack_lines_batch ON repack_lines(batch_id);
+
+-- The batch a pack line made; NULL for batches from a purchase entry.
+ALTER TABLE item_batches ADD COLUMN repack_id TEXT REFERENCES repacks(id) ON DELETE RESTRICT;
+ALTER TABLE inventory_movements ADD COLUMN repack_id TEXT REFERENCES repacks(id) ON DELETE RESTRICT;
+
+CREATE TRIGGER IF NOT EXISTS trg_item_batches_repack
+BEFORE INSERT ON item_batches
+WHEN NEW.repack_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM repacks r
+  WHERE r.id = NEW.repack_id AND r.kind = 'pack' AND r.store_id = NEW.store_id AND r.book_id = NEW.book_id)
+BEGIN
+  SELECT RAISE(ABORT, 'repack_batch_scope');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_item_batches_repack_frozen
+BEFORE UPDATE OF repack_id ON item_batches
+WHEN NEW.repack_id IS NOT OLD.repack_id
+BEGIN
+  SELECT RAISE(ABORT, 'batch_version_not_bumped');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_repacks_scope
+BEFORE INSERT ON repacks
+WHEN NOT EXISTS (SELECT 1 FROM item_batches b
+                 WHERE b.id = NEW.bulk_batch_id AND b.store_id = NEW.store_id
+                   AND EXISTS (SELECT 1 FROM item_repack_sources s WHERE s.bulk_item_id = b.item_id))
+  OR NOT EXISTS (SELECT 1 FROM books k WHERE k.id = NEW.book_id AND k.store_id = NEW.store_id)
+BEGIN
+  SELECT RAISE(ABORT, 'repack_scope_invalid');
+END;
+
+-- A pack line: the item is mapped to the bulk item, the content is the item's,
+-- the batch is new (made by this repack, in its book) and carries an MRP. An
+-- unpack line: a batch packed from this same bulk batch, at the content it was packed at.
+CREATE TRIGGER IF NOT EXISTS trg_repack_lines_valid
+BEFORE INSERT ON repack_lines
+WHEN NOT EXISTS (
+  SELECT 1 FROM repacks r
+  JOIN item_batches bb ON bb.id = r.bulk_batch_id
+  JOIN item_repack_sources s ON s.item_id = NEW.item_id AND s.bulk_item_id = bb.item_id
+  JOIN item_batches lb ON lb.id = NEW.batch_id AND lb.item_id = NEW.item_id
+                      AND lb.store_id = r.store_id AND lb.book_id = r.book_id
+  WHERE r.id = NEW.repack_id
+    AND ((r.kind = 'pack' AND lb.repack_id = r.id AND lb.mrp_minor IS NOT NULL
+          AND NEW.content_qty_base = (SELECT content_qty_base FROM items WHERE id = NEW.item_id)
+          AND NOT EXISTS (SELECT 1 FROM repack_lines x WHERE x.batch_id = NEW.batch_id))
+      OR (r.kind = 'unpack'
+          AND (SELECT bulk_batch_id FROM repacks WHERE id = lb.repack_id) = r.bulk_batch_id
+          AND NEW.content_qty_base = (SELECT x.content_qty_base FROM repack_lines x
+                                      WHERE x.repack_id = lb.repack_id AND x.batch_id = lb.id))))
+BEGIN
+  SELECT RAISE(ABORT, 'repack_line_invalid');
+END;
+
+-- The ledger is written by the DDL, so a repack can never move one side only:
+-- per line, packs x content out of the bulk batch and packs into the pack batch
+-- (reversed for an unpack); the loss once, out of the bulk batch.
+CREATE TRIGGER IF NOT EXISTS trg_repack_lines_move
+AFTER INSERT ON repack_lines
+BEGIN
+  INSERT INTO inventory_movements (id, item_id, direction, qty_base, occurred_at, created_at, batch_id,
+                                   store_id, reason, created_by, repack_id)
+  SELECT NEW.repack_id || ':' || NEW.line_no || ':bulk', bb.item_id,
+         CASE r.kind WHEN 'pack' THEN 'out' ELSE 'in' END, NEW.qty_base * NEW.content_qty_base,
+         r.packed_at, r.created_at, bb.id, r.store_id, 'repack', r.created_by, r.id
+  FROM repacks r JOIN item_batches bb ON bb.id = r.bulk_batch_id WHERE r.id = NEW.repack_id
+  UNION ALL
+  SELECT NEW.repack_id || ':' || NEW.line_no || ':pack', NEW.item_id,
+         CASE r.kind WHEN 'pack' THEN 'in' ELSE 'out' END, NEW.qty_base,
+         r.packed_at, r.created_at, NEW.batch_id, r.store_id, 'repack', r.created_by, r.id
+  FROM repacks r WHERE r.id = NEW.repack_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_repacks_loss
+AFTER INSERT ON repacks
+WHEN NEW.loss_qty_base > 0
+BEGIN
+  INSERT INTO inventory_movements (id, item_id, direction, qty_base, occurred_at, created_at, batch_id,
+                                   store_id, reason, created_by, repack_id)
+  SELECT NEW.id || ':loss', b.item_id, 'out', NEW.loss_qty_base, NEW.packed_at, NEW.created_at, b.id,
+         NEW.store_id, 'repack', NEW.created_by, NEW.id
+  FROM item_batches b WHERE b.id = NEW.bulk_batch_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_repacks_frozen
+BEFORE UPDATE ON repacks
+BEGIN
+  SELECT RAISE(ABORT, 'repack_immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_repacks_no_delete
+BEFORE DELETE ON repacks
+BEGIN
+  SELECT RAISE(ABORT, 'repack_immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_repack_lines_frozen
+BEFORE UPDATE ON repack_lines
+BEGIN
+  SELECT RAISE(ABORT, 'repack_immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_repack_lines_no_delete
+BEFORE DELETE ON repack_lines
+BEGIN
+  SELECT RAISE(ABORT, 'repack_immutable');
 END;
 
 UPDATE schema_meta SET schema_version = 8 WHERE id = 1;

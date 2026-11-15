@@ -82,6 +82,18 @@ QUERIES = {
     "batch prices (register, after pick)": (
         "SELECT qty_base, price_minor, mrp_minor, version FROM item_prices "
         "WHERE item_id = ? AND batch_id = ? AND valid_to IS NULL ORDER BY qty_base"),
+    "parent batch for a child line (register, at scan)": (
+        "SELECT b.id FROM item_batches b JOIN books k ON k.id = b.book_id AND k.active = 1 "
+        "LEFT JOIN batch_stock s ON s.batch_id = b.id WHERE b.item_id = ? AND b.store_id = ? "
+        "AND b.retired_at IS NULL AND (b.expiry_date IS NULL OR b.expiry_date >= ?) "
+        "ORDER BY IFNULL(s.on_hand_qty_base, 0) > 0 DESC, k.priority, b.received_at DESC, b.id DESC LIMIT 1"),
+    "repack items of a bulk (admin repack entry)": (
+        "SELECT i.id, i.name, i.content_qty_base FROM item_repack_sources s JOIN items i ON i.id = s.item_id "
+        "WHERE s.bulk_item_id = ?"),
+    "packs that can go back to a bulk batch (admin unpack)": (
+        "SELECT l.batch_id, l.content_qty_base, s.on_hand_qty_base FROM repacks r "
+        "JOIN repack_lines l ON l.repack_id = r.id LEFT JOIN batch_stock s ON s.batch_id = l.batch_id "
+        "WHERE r.bulk_batch_id = ? AND r.kind = 'pack'"),
     "stock pull (GET /v1/stock)": (
         "SELECT batch_id, on_hand_qty_base, seq FROM batch_stock WHERE store_id = ? AND seq > ? "
         "ORDER BY seq LIMIT 500"),
@@ -108,7 +120,7 @@ QUERIES = {
 }
 
 BIG = {"bill_lines", "bills", "catalog_changes", "item_prices", "item_identifiers", "audit_events",
-       "inventory_movements", "auth_session", "devices", "sales_daily"}
+       "inventory_movements", "auth_session", "devices", "sales_daily", "repacks", "repack_lines"}
 
 bad = 0
 for name, q in QUERIES.items():
